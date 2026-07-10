@@ -17,7 +17,7 @@ import time as time_module
 import csv
 import multiprocessing
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 TOKEN = os.environ.get("TOKEN", "")
@@ -1234,7 +1234,7 @@ async def reminder_loop(app):
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                  MODULE: AI CHAT                             ║
 # ║  چت با چند منبع هوش مصنوعی (Groq اصلی، Gemini در صورت        ║
-# ║  داشتن کلید به‌عنوان پشتیبان) + محدودیت روزانه ویرایش عکس    ║
+# ║  داشتن کلید به‌عنوان پشتیبان)                                 ║
 # ║  برای حذف: این بلوک رو پاک کن                                ║
 # ║  + خط menu_ai رو از main_menu پاک کن                        ║
 # ║  + خط ai_ رو از ROUTER پاک کن                                ║
@@ -1247,48 +1247,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # اختیاری - وقت
 GROQ_MODEL = "openai/gpt-oss-120b"
 GEMINI_MODEL = "gemini-2.0-flash"
 
-IMAGE_EDIT_DAILY_LIMIT = 4
-
 # ─── دیتابیس این ماژول ──────────────────────────────────────
 def init_ai_db():
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS ai_image_usage (
-        user_id    INTEGER PRIMARY KEY,
-        used_count INTEGER DEFAULT 0,
-        reset_date TEXT
-    )''')
-    conn.commit()
-    conn.close()
-
-def get_iran_today_str():
-    """تاریخ امروز به وقت ایران (برای تشخیص ریست نیمه‌شب ایران)"""
-    from datetime import timezone
-    iran_now = datetime.now(timezone.utc) + timedelta(hours=3, minutes=30)
-    return iran_now.strftime("%Y-%m-%d")
-
-def get_image_usage(user_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT used_count, reset_date FROM ai_image_usage WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    today = get_iran_today_str()
-    if not row or row[1] != today:
-        return 0, today
-    return row[0], row[1]
-
-def increment_image_usage(user_id):
-    used, today = get_image_usage(user_id)
-    used += 1
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute('''INSERT INTO ai_image_usage (user_id, used_count, reset_date) VALUES (?, ?, ?)
-                 ON CONFLICT(user_id) DO UPDATE SET used_count=excluded.used_count, reset_date=excluded.reset_date''',
-              (user_id, used, today))
-    conn.commit()
-    conn.close()
-    return used
+    pass  # این ماژول در حال حاضر جدول اختصاصی نیاز ندارد
 
 # ─── فراخوانی Groq (منبع اصلی چت) ───────────────────────────
 async def call_groq_chat(messages):
@@ -1400,7 +1361,8 @@ async def handle_ai_message(user_id, text, update):
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                  MODULE: KIDS                                ║
-# ║  قصه‌گویی هوشمند متناسب با سن و جنسیت کودک + خروجی PDF       ║
+# ║  قصه‌گویی هوشمند متناسب با سن و جنسیت کودک (فقط متن؛ خروجی    ║
+# ║  PDF طبق تصمیم کاربر حذف شد)                                 ║
 # ║  از همان منبع AI ماژول قبلی (Groq/Gemini) استفاده می‌کند      ║
 # ║  برای حذف: این بلوک رو پاک کن                                ║
 # ║  + خط menu_kids رو از main_menu پاک کن                      ║
@@ -1686,68 +1648,8 @@ async def kids_find_story_by_name(story_name):
     }
     return story_data, "دانش هوش مصنوعی"
 
-# ─── ساخت PDF فارسی برای قصه ──────────────────────────────────
-FONT_CACHE_PATH = "/tmp/Vazirmatn-Regular.ttf"
-FONT_DOWNLOAD_URLS = [
-    "https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/fonts/ttf/Vazirmatn-Regular.ttf",
-    "https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf",
-]
-
-async def ensure_persian_font():
-    """
-    دانلود و کش کردن فونت فارسی Vazirmatn در /tmp (یک‌بار در طول اجرای ربات).
-    این روش نیازی به آپلود دستی فایل فونت در پروژه ندارد.
-    """
-    if os.path.exists(FONT_CACHE_PATH) and os.path.getsize(FONT_CACHE_PATH) > 10000:
-        return FONT_CACHE_PATH
-    for url in FONT_DOWNLOAD_URLS:
-        try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                r = await client.get(url)
-                if r.status_code == 200 and len(r.content) > 10000:
-                    with open(FONT_CACHE_PATH, "wb") as f:
-                        f.write(r.content)
-                    print(f"✅ فونت فارسی با موفقیت دانلود شد از: {url}")
-                    return FONT_CACHE_PATH
-        except Exception as e:
-            print(f"خطای دانلود فونت از {url}: {e}")
-            continue
-    print("⚠️ هیچ‌کدام از منابع فونت فارسی در دسترس نبودند.")
-    return None
-
-async def build_story_pdf(title, story_text):
-    """
-    ساخت PDF فارسی با fpdf2. فونت فارسی به‌صورت خودکار از CDN دانلود و کش می‌شود
-    (نیازی به آپلود دستی فایل فونت در پروژه نیست).
-    اگر دانلود فونت ناموفق باشد، خطا چاپ می‌شود و تابع None برمی‌گرداند (یعنی فقط
-    متن در چت نمایش داده می‌شود، بدون فایل PDF).
-    """
-    try:
-        from fpdf import FPDF
-        font_path = await ensure_persian_font()
-        if not font_path:
-            return None
-
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.add_font("Vazirmatn", "", font_path, uni=True)
-        pdf.set_font("Vazirmatn", size=16)
-        pdf.set_text_shaping(True)  # ضروری برای رندر درست راست‌به‌چپ فارسی
-        pdf.multi_cell(0, 12, title, align="C")
-        pdf.ln(5)
-        pdf.set_font("Vazirmatn", size=13)
-        pdf.multi_cell(0, 10, story_text, align="R")
-
-        buffer = io.BytesIO()
-        pdf.output(buffer)
-        buffer.seek(0)
-        return buffer
-    except Exception as e:
-        print(f"خطای ساخت PDF قصه: {e}")
-        return None
-
 async def kids_send_story(update_or_query, story_text, title, is_message):
-    """ارسال قصه (تکه‌تکه در صورت طولانی بودن) + فایل PDF"""
+    """ارسال قصه (تکه‌تکه در صورت طولانی بودن)"""
     full_text = f"📖 {title}\n\n{story_text}"
     TELEGRAM_LIMIT = 4000
     if is_message:
@@ -1762,14 +1664,6 @@ async def kids_send_story(update_or_query, story_text, title, is_message):
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             await send_func(chunk, reply_markup=kids_menu() if is_last else None)
-
-    pdf_buffer = await build_story_pdf(title, story_text)
-    if pdf_buffer:
-        await update_or_query.message.reply_document(
-            document=pdf_buffer,
-            filename=f"{title}.pdf",
-            caption="📥 نسخه PDF قصه برای نگهداری یا چاپ"
-        )
 
 # ─── هندلر دکمه‌ها ────────────────────────────────────────────
 async def handle_kids(query, user_id):
@@ -2429,25 +2323,6 @@ def save_exercise_plan(member_id, goal, plan_text):
               (member_id, goal, plan_text, get_iran_now().strftime("%Y-%m-%d %H:%M")))
     conn.commit()
     conn.close()
-
-def get_exercise_plan(member_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT goal, plan_text FROM health_exercise_plan WHERE member_id=?", (member_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-BOOK_SUGGESTIONS = [
-    ("ملت عشق", "الیف شافاک", "عاشقانه/فلسفی"),
-    ("کیمیاگر", "پائولو کوئیلو", "فلسفی/الهام‌بخش"),
-    ("صد سال تنهایی", "گابریل گارسیا مارکز", "رئالیسم جادویی"),
-    ("بوف کور", "صادق هدایت", "ادبیات کلاسیک فارسی"),
-    ("جنایت و مکافات", "داستایوفسکی", "روان‌شناختی/کلاسیک"),
-    ("کافکا در کنار دریا", "هاروکی موراکامی", "رئالیسم جادویی مدرن"),
-    ("شازده کوچولو", "آنتوان دو سنت اگزوپری", "فلسفی/کودک و بزرگسال"),
-    ("هزار خورشید تابان", "خالد حسینی", "درام اجتماعی"),
-]
 
 # ─── هندلر دکمه‌ها ────────────────────────────────────────────
 async def handle_fun(query, user_id):
@@ -3335,15 +3210,6 @@ async def handle_antifilter(query, user_id):
 # ║  + خط adm_ رو از ROUTER اصلی پاک کن                            ║
 # ║  + state های adm_ رو از message_handler پاک کن                 ║
 # ╚══════════════════════════════════════════════════════════════╝
-
-def admin_get_all_active_user_ids():
-    """دریافت آیدی همه‌ی کاربران فعال (بدون محدودیت تعداد) -- برای ارسال پیام همگانی"""
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE status='active'")
-    rows = [row[0] for row in c.fetchall()]
-    conn.close()
-    return rows
 
 def admin_get_all_users(limit=30):
     conn = sqlite3.connect("bot.db")
@@ -4739,12 +4605,6 @@ def r_level_question_menu(r_mult):
         [InlineKeyboardButton("❌ نه، رد شو", callback_data=f"bt_r_no_{r_mult}")],
     ])
 
-def yes_no_menu(yes_cb, no_cb):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ بله", callback_data=yes_cb)],
-        [InlineKeyboardButton("❌ خیر", callback_data=no_cb)],
-    ])
-
 def direction_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📈 Long (خرید)", callback_data="bt_dir_long")],
@@ -5870,12 +5730,6 @@ INDICATOR_DEFS = {
 }
 
 # ─── محاسبات ریاضی اندیکاتورها (خود ربات محاسبه می‌کند، نه AI) ──
-def calc_sma(prices, period):
-    result = [None] * len(prices)
-    for i in range(period - 1, len(prices)):
-        result[i] = sum(prices[i - period + 1:i + 1]) / period
-    return result
-
 def calc_ema(prices, period):
     result = [None] * len(prices)
     if len(prices) < period:
