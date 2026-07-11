@@ -3537,6 +3537,16 @@ def admin_get_all_active_user_ids():
     conn.close()
     return [r[0] for r in rows]
 
+def parse_broadcast_target_ids(data):
+    """
+    تبدیل مقدار ذخیره‌شده در state (که می‌تواند "all" یا رشته‌ای از
+    آیدی‌های جدا‌شده با کاما باشد) به لیست آیدی‌های عددی مقصد. مشترک
+    بین مسیر متنی و مسیر انتخاب از کتابخانه در ارسال پیام همگانی.
+    """
+    if data == "all":
+        return admin_get_all_active_user_ids()
+    return [int(x.strip()) for x in data.split(",") if x.strip().isdigit()]
+
 def admin_get_stats():
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
@@ -3652,10 +3662,16 @@ async def handle_admin_panel(query, user_id, context):
         )
 
     elif data == "adm_broadcast_all":
-        set_state(user_id, "adm_awaiting_broadcast_text", "all")
+        set_state(user_id, "adm_awaiting_broadcast_content", "all")
         await query.edit_message_text(
-            "📣 متن پیامی که می‌خواهید به همه‌ی کاربران فعال ارسال شود را بنویسید:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="adm_broadcast_menu")]])
+            "📣 محتوایی که می‌خواهید به همه‌ی کاربران فعال ارسال شود را همین‌جا بفرستید "
+            "(متن، عکس، فایل، صدا، ویدیو -- حتی فوروارد از یک کانال دیگر)، یا از "
+            "کتابخانه انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📚 انتخاب فایل آماده", callback_data="adm_broadcast_pick_file"),
+                 InlineKeyboardButton("💬 انتخاب متن آماده", callback_data="adm_broadcast_pick_text")],
+                [InlineKeyboardButton("🔙 برگشت", callback_data="adm_broadcast_menu")],
+            ])
         )
 
     elif data == "adm_broadcast_list":
@@ -3672,22 +3688,101 @@ async def handle_admin_panel(query, user_id, context):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="adm_broadcast_menu")]])
         )
 
+    elif data == "adm_broadcast_pick_file":  # ← حذف = پاک کن این ۴ بلوک elif
+        state, target_data = get_state(user_id)
+        if state != "adm_awaiting_broadcast_content" or not target_data:
+            await query.answer("اول باید مقصد پیام را انتخاب کنید.", show_alert=True)
+            return
+        files = get_admin_files()
+        if not files:
+            await query.answer("هنوز فایلی در کتابخانه ثبت نشده.", show_alert=True)
+            return
+        rows = [[InlineKeyboardButton(f"📄 {label}", callback_data=f"adm_broadcast_use_file_{fid}")]
+                for fid, label, *_rest in files]
+        rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")])
+        await query.edit_message_text("📚 کدام فایل ارسال شود؟", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data.startswith("adm_broadcast_use_file_"):
+        state, target_data = get_state(user_id)
+        if state != "adm_awaiting_broadcast_content" or not target_data:
+            await query.answer("این عملیات منقضی شده؛ دوباره از منوی ارسال پیام شروع کنید.", show_alert=True)
+            return
+        file_db_id = int(data.replace("adm_broadcast_use_file_", ""))
+        row = get_admin_file(file_db_id)
+        if not row:
+            await query.answer("این فایل پیدا نشد.", show_alert=True)
+            return
+        target_ids = parse_broadcast_target_ids(target_data)
+        label, file_type, file_id, caption = row
+        import json
+        set_state(user_id, "adm_broadcast_ready",
+                   json.dumps({"target_ids": target_ids, "file_type": file_type, "file_id": file_id, "caption": caption}))
+        await send_content_by_type(context, ADMIN_ID, file_type, file_id, caption, default_caption=label)
+        await query.message.reply_text(
+            f"👆 پیش‌نمایش بالا. این محتوا به {len(target_ids)} کاربر ارسال خواهد شد. تأیید می‌کنید؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ بله، ارسال کن", callback_data="adm_broadcast_confirm_send")],
+                [InlineKeyboardButton("❌ لغو", callback_data="admin_panel")],
+            ])
+        )
+
+    elif data == "adm_broadcast_pick_text":
+        state, target_data = get_state(user_id)
+        if state != "adm_awaiting_broadcast_content" or not target_data:
+            await query.answer("اول باید مقصد پیام را انتخاب کنید.", show_alert=True)
+            return
+        texts = get_admin_texts()
+        if not texts:
+            await query.answer("هنوز متنی در کتابخانه ثبت نشده.", show_alert=True)
+            return
+        rows = [[InlineKeyboardButton(f"💬 {label}", callback_data=f"adm_broadcast_use_text_{tid}")]
+                for tid, label, _content in texts]
+        rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")])
+        await query.edit_message_text("💬 کدام متن ارسال شود؟", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data.startswith("adm_broadcast_use_text_"):
+        state, target_data = get_state(user_id)
+        if state != "adm_awaiting_broadcast_content" or not target_data:
+            await query.answer("این عملیات منقضی شده؛ دوباره از منوی ارسال پیام شروع کنید.", show_alert=True)
+            return
+        text_id = int(data.replace("adm_broadcast_use_text_", ""))
+        row = get_admin_text(text_id)
+        if not row:
+            await query.answer("این متن پیدا نشد.", show_alert=True)
+            return
+        target_ids = parse_broadcast_target_ids(target_data)
+        label, content = row
+        import json
+        set_state(user_id, "adm_broadcast_ready",
+                   json.dumps({"target_ids": target_ids, "file_type": "text", "file_id": None, "caption": content}))
+        await query.edit_message_text(
+            f"👆 پیش‌نمایش:\n\n{content}\n\nاین متن به {len(target_ids)} کاربر ارسال خواهد شد. تأیید می‌کنید؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ بله، ارسال کن", callback_data="adm_broadcast_confirm_send")],
+                [InlineKeyboardButton("❌ لغو", callback_data="admin_panel")],
+            ])
+        )
+
     elif data == "adm_broadcast_confirm_send":
         state, sdata = get_state(user_id)
         if state != "adm_broadcast_ready":
             return
         import json
         payload = json.loads(sdata)
-        target_ids, message_text = payload["target_ids"], payload["message_text"]
+        target_ids = payload["target_ids"]
+        file_type = payload.get("file_type", "text")
+        file_id = payload.get("file_id")
+        caption = payload.get("caption")
+        if caption is None and "message_text" in payload:  # سازگاری با فرمت قدیمی، اگر جایی باقی مانده باشد
+            caption = payload["message_text"]
         await query.edit_message_text(f"⏳ در حال ارسال به {len(target_ids)} کاربر...")
         success_count, fail_count = 0, 0
         for target_id in target_ids:
-            try:
-                await context.bot.send_message(target_id, message_text)
+            sent = await send_content_by_type(context, target_id, file_type, file_id, caption)
+            if sent:
                 success_count += 1
-            except Exception as e:
+            else:
                 fail_count += 1
-                print(f"خطای ارسال پیام همگانی به {target_id}: {e}")
             await asyncio.sleep(0.05)  # فاصله‌ی کوچک برای احترام به محدودیت سرعت تلگرام
         clear_state(user_id)
         await query.message.reply_text(
@@ -3968,19 +4063,17 @@ async def handle_admin_panel_message(user_id, text, update):
         return False
     state, data = get_state(user_id)
 
-    if state == "adm_awaiting_broadcast_text":
+    if state == "adm_awaiting_broadcast_content":
         # data شامل "all" یا رشته‌ی آیدی‌های جدا‌شده با کاما است (بسته به مبدأ)
         message_text = text
-        if data == "all":
-            target_ids = admin_get_all_active_user_ids()
-        else:
-            target_ids = [int(x.strip()) for x in data.split(",") if x.strip().isdigit()]
+        target_ids = parse_broadcast_target_ids(data)
         if not target_ids:
             await update.message.reply_text("❌ هیچ مقصدی برای ارسال پیدا نشد.", reply_markup=admin_panel_menu())
             clear_state(user_id)
             return True
         import json
-        set_state(user_id, "adm_broadcast_ready", json.dumps({"target_ids": target_ids, "message_text": message_text}))
+        set_state(user_id, "adm_broadcast_ready",
+                  json.dumps({"target_ids": target_ids, "file_type": "text", "file_id": None, "caption": message_text}))
         await update.message.reply_text(
             f"📢 پیش‌نمایش پیام:\n\n{message_text}\n\n"
             f"این پیام به {len(target_ids)} کاربر ارسال خواهد شد. تأیید می‌کنید؟",
@@ -4001,8 +4094,16 @@ async def handle_admin_panel_message(user_id, text, update):
         if not target_ids:
             await update.message.reply_text("❌ هیچ آیدی معتبری پیدا نشد. دوباره امتحان کنید:")
             return True
-        set_state(user_id, "adm_awaiting_broadcast_text", ",".join(str(i) for i in target_ids))
-        await update.message.reply_text(f"✅ {len(target_ids)} آیدی ثبت شد.\n\nحالا متن پیام را بنویسید:")
+        set_state(user_id, "adm_awaiting_broadcast_content", ",".join(str(i) for i in target_ids))
+        await update.message.reply_text(
+            f"✅ {len(target_ids)} آیدی ثبت شد.\n\n"
+            f"حالا محتوا را بفرستید (متن، عکس، فایل، صدا، ویدیو -- حتی فوروارد از یک "
+            f"کانال دیگر)، یا از کتابخانه انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📚 انتخاب فایل آماده", callback_data="adm_broadcast_pick_file"),
+                 InlineKeyboardButton("💬 انتخاب متن آماده", callback_data="adm_broadcast_pick_text")],
+            ])
+        )
         return True
 
     elif state == "adm_awaiting_broadcast_single_id":
@@ -4011,8 +4112,16 @@ async def handle_admin_panel_message(user_id, text, update):
         except ValueError:
             await update.message.reply_text("❌ لطفاً فقط آیدی عددی وارد کنید:")
             return True
-        set_state(user_id, "adm_awaiting_broadcast_text", str(target_id))
-        await update.message.reply_text("✅ آیدی ثبت شد.\n\nحالا متن پیام را بنویسید:")
+        set_state(user_id, "adm_awaiting_broadcast_content", str(target_id))
+        await update.message.reply_text(
+            "✅ آیدی ثبت شد.\n\n"
+            "حالا محتوا را بفرستید (متن، عکس، فایل، صدا، ویدیو -- حتی فوروارد از یک "
+            "کانال دیگر)، یا از کتابخانه انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📚 انتخاب فایل آماده", callback_data="adm_broadcast_pick_file"),
+                 InlineKeyboardButton("💬 انتخاب متن آماده", callback_data="adm_broadcast_pick_text")],
+            ])
+        )
         return True
 
     elif state == "adm_awaiting_pricing_text":  # ← حذف = پاک کن این بلوک
@@ -8279,6 +8388,52 @@ async def handle_admin_library_file_upload(update, context):
     await update.message.reply_text(f"✅ فایل «{label}» به کتابخانه اضافه شد.", reply_markup=admin_library_menu())
     return True
 
+async def handle_admin_broadcast_content_media(update, context):
+    """
+    دریافت محتوای غیرمتنی (عکس/فایل/صدا/ویدیو -- حتی فوروارد از یک
+    کانال دیگر) برای ارسال پیام همگانی از پنل مدیریت. پیام‌های متنی
+    ساده از این تابع عبور می‌کنند (return False) تا توسط منطق قدیمی
+    و ساده‌تر در handle_admin_panel_message پردازش شوند؛ این تابع فقط
+    مسئول انواع رسانه‌ای است که آن تابع (چون فقط پیام‌های متنی را
+    می‌بیند) اصلاً نمی‌تواند دریافت کند.
+    خروجی: True اگر پردازش شد، False در غیر این صورت.
+    """
+    admin_user_id = update.effective_user.id
+    if admin_user_id != ADMIN_ID:
+        return False
+    state, target_data = get_state(ADMIN_ID)
+    if state != "adm_awaiting_broadcast_content":
+        return False
+
+    msg = update.message
+    if msg.text and not (msg.document or msg.photo or msg.audio or msg.video or msg.voice):
+        return False  # متن خالص -- بگذار handle_admin_panel_message پردازشش کند
+
+    file_type, file_id = detect_message_content(msg)
+    if file_type is None:
+        await update.message.reply_text("❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.")
+        return True
+
+    target_ids = parse_broadcast_target_ids(target_data)
+    if not target_ids:
+        await update.message.reply_text("❌ هیچ مقصدی برای ارسال پیدا نشد.", reply_markup=admin_panel_menu())
+        clear_state(ADMIN_ID)
+        return True
+
+    caption = msg.caption
+    import json
+    set_state(ADMIN_ID, "adm_broadcast_ready",
+              json.dumps({"target_ids": target_ids, "file_type": file_type, "file_id": file_id, "caption": caption}))
+    await send_content_by_type(context, ADMIN_ID, file_type, file_id, caption)
+    await update.message.reply_text(
+        f"👆 پیش‌نمایش بالا. این محتوا به {len(target_ids)} کاربر ارسال خواهد شد. تأیید می‌کنید؟",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ بله، ارسال کن", callback_data="adm_broadcast_confirm_send")],
+            [InlineKeyboardButton("❌ لغو", callback_data="admin_panel")],
+        ])
+    )
+    return True
+
 async def handle_license_chat_content(update, context):
     """
     رله‌ی دوطرفه‌ی محتوا (متن/عکس/فایل/صدا/ویدیو، حتی فوروارد از یک
@@ -8325,8 +8480,9 @@ async def handle_admin_generic_content(update, context):
     دیسپچر ترکیبی برای همه‌ی فیچرهایی که نیاز به رد و بدل کردن محتوای
     آزاد (متن/عکس/فایل/صدا/ویدیو) بین ادمین و یک کاربر خاص دارند --
     ربات مدیریت سرمایه، پاسخ به پیام کاربر، تنظیم فایل نسخه‌ی تست/پولی،
-    کتابخانه‌ی فایل‌های آماده، و چت زنده‌ی لایسنس. هر تابع خودش بر اساس
-    state فعلی فرستنده تشخیص می‌دهد که آیا باید پردازش کند یا نه.
+    کتابخانه‌ی فایل‌های آماده، ارسال پیام همگانی، و چت زنده‌ی لایسنس.
+    هر تابع خودش بر اساس state فعلی فرستنده تشخیص می‌دهد که آیا باید
+    پردازش کند یا نه.
     """
     if await handle_admin_capital_content(update, context):
         return True
@@ -8335,6 +8491,8 @@ async def handle_admin_generic_content(update, context):
     if await handle_admin_keyed_file_upload(update, context):
         return True
     if await handle_admin_library_file_upload(update, context):
+        return True
+    if await handle_admin_broadcast_content_media(update, context):
         return True
     if await handle_license_chat_content(update, context):
         return True
