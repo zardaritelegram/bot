@@ -60,6 +60,20 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS user_admin_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, message_text TEXT, replied INTEGER DEFAULT 0, created_at TEXT)''')  # ← حذف فیچر پیام به ادمین = پاک کن این خط
+    c.execute('''CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY, value TEXT)''')  # ← حذف اگه هیچ فیچری ازش استفاده نکرد = پاک کن این خط
+    c.execute('''CREATE TABLE IF NOT EXISTS trial_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, created_at TEXT)''')  # ← حذف فیچر نسخه تست ربات مدیریت سرمایه = پاک کن این خط
+    c.execute('''CREATE TABLE IF NOT EXISTS license_chats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, status TEXT DEFAULT 'pending', created_at TEXT)''')  # ← حذف فیچر چت لایسنس = پاک کن این خط
+    c.execute('''CREATE TABLE IF NOT EXISTS admin_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT, file_type TEXT, file_id TEXT, caption TEXT, created_at TEXT)''')  # ← حذف کتابخانه فایل ادمین = پاک کن این خط
+    c.execute('''CREATE TABLE IF NOT EXISTS admin_texts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT, content TEXT, created_at TEXT)''')  # ← حذف کتابخانه متن ادمین = پاک کن این خط
     for col_def in [
         "ALTER TABLE users ADD COLUMN daily_msg INTEGER DEFAULT 1",
         "ALTER TABLE users ADD COLUMN referral_code TEXT",
@@ -487,6 +501,244 @@ def mark_capital_request_fulfilled(request_id):
     conn.commit()
     conn.close()
 
+# ─── تنظیمات کلی کلید-مقدار (برای فایل نسخه‌ی تست و مشابه) ──────
+def set_bot_setting(key, value):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+              (key, value))
+    conn.commit()
+    conn.close()
+
+def get_bot_setting(key):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT value FROM bot_settings WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# ─── درخواست نسخه‌ی تست ربات مدیریت سرمایه ──────────────────────
+def save_trial_request(user_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO trial_requests (user_id, created_at) VALUES (?, ?)",
+              (user_id, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+# ─── چت زنده‌ی لایسنس (بین ادمین و کاربر، دوطرفه) ────────────────
+def create_license_chat(user_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO license_chats (user_id, status, created_at) VALUES (?, 'pending', ?)",
+              (user_id, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    chat_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return chat_id
+
+def get_license_chat(chat_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT user_id, status FROM license_chats WHERE id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def update_license_chat_status(chat_id, status):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("UPDATE license_chats SET status=? WHERE id=?", (status, chat_id))
+    conn.commit()
+    conn.close()
+
+# ─── کتابخانه‌ی فایل‌های آماده‌ی ادمین (حداکثر ۱۰ عدد) ────────────
+def add_admin_file(label, file_type, file_id, caption):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO admin_files (label, file_type, file_id, caption, created_at) VALUES (?, ?, ?, ?, ?)",
+              (label, file_type, file_id, caption, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    file_db_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return file_db_id
+
+def get_admin_files():
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT id, label, file_type, file_id, caption FROM admin_files ORDER BY id")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_admin_file(file_db_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT label, file_type, file_id, caption FROM admin_files WHERE id=?", (file_db_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def delete_admin_file(file_db_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM admin_files WHERE id=?", (file_db_id,))
+    conn.commit()
+    conn.close()
+
+def count_admin_files():
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM admin_files")
+    n = c.fetchone()[0]
+    conn.close()
+    return n
+
+# ─── کتابخانه‌ی متن‌های آماده‌ی ادمین (نامحدود، قابل ویرایش) ───────
+def add_admin_text(label, content):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO admin_texts (label, content, created_at) VALUES (?, ?, ?)",
+              (label, content, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    text_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return text_id
+
+def get_admin_texts():
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT id, label, content FROM admin_texts ORDER BY id")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_admin_text(text_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT label, content FROM admin_texts WHERE id=?", (text_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def update_admin_text(text_id, label, content):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("UPDATE admin_texts SET label=?, content=? WHERE id=?", (label, content, text_id))
+    conn.commit()
+    conn.close()
+
+def delete_admin_text(text_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM admin_texts WHERE id=?", (text_id,))
+    conn.commit()
+    conn.close()
+
+def detect_message_content(msg):
+    """
+    تشخیص نوع و شناسه‌ی فایل یک پیام تلگرام (برای ذخیره‌سازی طولانی‌مدت،
+    نه ارسال مستقیم). خروجی: (file_type, file_id) یا (None, None) اگر
+    نوع پشتیبانی نشود. برای متن، file_id همیشه None است (چون متن خودش
+    در caption/content ذخیره می‌شود، نه با file_id).
+    """
+    if msg.document:
+        return "document", msg.document.file_id
+    if msg.photo:
+        return "photo", msg.photo[-1].file_id
+    if msg.audio:
+        return "audio", msg.audio.file_id
+    if msg.video:
+        return "video", msg.video.file_id
+    if msg.voice:
+        return "voice", msg.voice.file_id
+    if msg.text:
+        return "text", None
+    return None, None
+
+# ─── ربات مدیریت سرمایه: نسخه‌ی تست و لایسنس پولی ────────────────
+# قیمت واقعی و روش پرداخت از پنل مدیریت → کتابخانه‌ی فایل و متن →
+# «💰 متن قیمت‌گذاری لایسنس» تنظیم و ذخیره می‌شود (چون ممکن است
+# تغییر کند و نباید داخل کد ثابت باشد). متن زیر فقط یک fallback است
+# که فقط تا وقتی ادمین هنوز چیزی تنظیم نکرده نمایش داده می‌شود.
+CAPITAL_LICENSE_PRICING_TEXT_FALLBACK = (
+    "💳 لایسنس ربات مدیریت سرمایه\n\n"
+    "قیمت‌ها و روش پرداخت هنوز از پنل مدیریت تنظیم نشده است.\n\n"
+    "برای اطلاع از قیمت و شرایط، «✅ درخواست دارم» را بزنید تا مستقیم "
+    "با ادمین در ارتباط باشید."
+)
+
+def capital_bot_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 دریافت نسخه تست ۷ روزه", callback_data="cap_trial"),
+         InlineKeyboardButton("💳 نسخه پولی (لایسنس‌دار)", callback_data="cap_paid")],
+        [InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")],
+    ])
+
+async def send_content_by_type(context, chat_id, file_type, file_id, caption, default_caption=None):
+    """
+    ارسال محتوا بر اساس نوعش (که قبلاً ذخیره یا از یک پیام تلگرام تشخیص
+    داده شده) به یک چت مشخص. برای فایل تست ذخیره‌شده و هر فیچر مشابه
+    دیگری قابل استفاده است. خروجی: True در صورت موفقیت، False در خطا.
+    """
+    try:
+        final_caption = caption or default_caption
+        if file_type == "document":
+            await context.bot.send_document(chat_id=chat_id, document=file_id, caption=final_caption)
+        elif file_type == "photo":
+            await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=final_caption)
+        elif file_type == "audio":
+            await context.bot.send_audio(chat_id=chat_id, audio=file_id, caption=final_caption)
+        elif file_type == "video":
+            await context.bot.send_video(chat_id=chat_id, video=file_id, caption=final_caption)
+        elif file_type == "voice":
+            await context.bot.send_voice(chat_id=chat_id, voice=file_id, caption=final_caption)
+        elif file_type == "text":
+            await context.bot.send_message(chat_id=chat_id, text=final_caption or "")
+        else:
+            return False
+        return True
+    except Exception as e:
+        print(f"خطای ارسال محتوا با send_content_by_type: {e}")
+        return False
+
+async def relay_free_message(msg, context, target_chat_id, prefix=None):
+    """
+    تشخیص نوع یک پیام تلگرام واقعی (متن/عکس/فایل/صدا/ویدیو -- حتی اگر
+    خود پیام از یک کانال یا چت دیگر فوروارد شده باشد، چون msg.photo/
+    msg.document/... مستقل از فوروارد بودن همیشه در دسترس‌اند) و ارسال
+    مستقیم آن به یک چت مقصد، بدون افشای منبع اصلی. برای ربات مدیریت
+    سرمایه، پاسخ به پیام کاربر، و چت زنده‌ی لایسنس مشترک است.
+    خروجی: True در صورت موفقیت، False اگر نوع پیام پشتیبانی نشود یا خطا بدهد.
+    """
+    try:
+        caption = msg.caption or None
+        if prefix and caption:
+            caption = f"{prefix}{caption}"
+        elif prefix and not caption:
+            caption = prefix.strip()
+
+        if msg.document:
+            await context.bot.send_document(chat_id=target_chat_id, document=msg.document.file_id, caption=caption)
+        elif msg.photo:
+            await context.bot.send_photo(chat_id=target_chat_id, photo=msg.photo[-1].file_id, caption=caption)
+        elif msg.audio:
+            await context.bot.send_audio(chat_id=target_chat_id, audio=msg.audio.file_id, caption=caption)
+        elif msg.video:
+            await context.bot.send_video(chat_id=target_chat_id, video=msg.video.file_id, caption=caption)
+        elif msg.voice:
+            await context.bot.send_voice(chat_id=target_chat_id, voice=msg.voice.file_id, caption=caption)
+        elif msg.text:
+            text = f"{prefix}{msg.text}" if prefix else msg.text
+            await context.bot.send_message(chat_id=target_chat_id, text=text)
+        else:
+            return False
+        return True
+    except Exception as e:
+        print(f"خطای relay_free_message: {e}")
+        return False
+
 def financial_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💵 بازار ایران", callback_data="fin_currency"),
@@ -525,8 +777,8 @@ def watchlist_menu(user_id):
 
 def alarm_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ آلارم جدید", callback_data="alarm_new")],
-        [InlineKeyboardButton("📋 آلارم‌های فعال", callback_data="alarm_list")],
+        [InlineKeyboardButton("➕ آلارم جدید", callback_data="alarm_new"),
+         InlineKeyboardButton("📋 آلارم‌های فعال", callback_data="alarm_list")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")],
     ])
 
@@ -541,26 +793,95 @@ async def handle_financial(query, user_id, context):
         await query.edit_message_text("💰 بازارهای مالی:", reply_markup=financial_menu())
 
     elif data == "fin_capital_bot":
+        await query.edit_message_text(
+            "🤖 ربات مدیریت سرمایه\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
+            reply_markup=capital_bot_menu()
+        )
+
+    elif data == "cap_trial":
         requester = query.from_user
+        save_trial_request(user_id)
+        trial_setting = get_bot_setting("trial_file")
+
+        if trial_setting:
+            import json
+            info = json.loads(trial_setting)
+            sent = await send_content_by_type(
+                context, user_id, info["file_type"], info.get("file_id"), info.get("caption"),
+                default_caption="🎁 نسخه‌ی تست ۷ روزه‌ی ربات مدیریت سرمایه"
+            )
+            if sent:
+                await query.edit_message_text(
+                    "✅ نسخه‌ی تست برای شما ارسال شد؛ لطفاً پیام‌های چت را بررسی کنید.",
+                    reply_markup=capital_bot_menu()
+                )
+                try:
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"ℹ️ نسخه‌ی تست به‌صورت خودکار برای {requester.first_name} "
+                        f"(@{requester.username or 'ندارد'}, {user_id}) ارسال شد."
+                    )
+                except Exception as e:
+                    print(f"خطای اطلاع کوتاه ادمین از ارسال خودکار تست: {e}")
+                return
+            # اگر ارسال خودکار خطا داد (مثلاً file_id دیگر معتبر نیست)، به مسیر دستی زیر می‌رویم
+
+        # فایل تست هنوز تنظیم نشده (یا ارسال خودکارش خطا داد) -- به ادمین اطلاع بده
         request_id = save_capital_request(user_id)
         try:
             await context.bot.send_message(
                 ADMIN_ID,
-                f"🤖 درخواست جدید ربات مدیریت سرمایه\n\n"
+                f"🎁 درخواست نسخه‌ی تست ۷ روزه (فایل تست خودکار تنظیم نشده)\n\n"
                 f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
                 f"🆔 آیدی: {user_id}\n\n"
-                f"وقتی آماده بودید، روی دکمه‌ی زیر بزنید و متن، عکس، فایل، صدا یا "
-                f"ویدیوی موردنظر را همین‌جا (در همین چت) بفرستید تا خودکار برای "
-                f"کاربر ارسال شود.",
+                f"می‌توانید از پنل مدیریت، فایل تست را یک‌بار تنظیم کنید تا از این پس "
+                f"خودکار ارسال شود، یا همین یک‌بار با دکمه‌ی زیر دستی برایش بفرستید.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📤 آماده‌ام ارسال کنم", callback_data=f"admin_send_capital_{request_id}")]
                 ])
             )
         except Exception as e:
-            print(f"خطای اطلاع‌رسانی درخواست ربات مدیریت سرمایه به ادمین: {e}")
+            print(f"خطای اطلاع‌رسانی درخواست نسخه‌ی تست به ادمین: {e}")
         await query.edit_message_text(
-            "✅ درخواست شما ثبت شد.\n\n"
-            "ادمین به‌زودی اطلاعات مربوط به ربات مدیریت سرمایه را برایتان ارسال می‌کند.",
+            "✅ درخواست شما ثبت شد؛ ادمین به‌زودی نسخه‌ی تست را برایتان ارسال می‌کند.",
+            reply_markup=capital_bot_menu()
+        )
+
+    elif data == "cap_paid":
+        pricing_text = get_bot_setting("pricing_text") or CAPITAL_LICENSE_PRICING_TEXT_FALLBACK
+        await query.edit_message_text(
+            pricing_text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ درخواست دارم", callback_data="cap_paid_confirm")],
+                [InlineKeyboardButton("❌ انصراف", callback_data="cap_paid_reject")],
+            ])
+        )
+
+    elif data == "cap_paid_reject":
+        await query.edit_message_text(
+            "🤖 ربات مدیریت سرمایه\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
+            reply_markup=capital_bot_menu()
+        )
+
+    elif data == "cap_paid_confirm":
+        requester = query.from_user
+        chat_id = create_license_chat(user_id)
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"💳 درخواست نسخه‌ی پولی (لایسنس) ربات مدیریت سرمایه\n\n"
+                f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
+                f"🆔 آیدی: {user_id}\n\n"
+                f"برای شروع مکالمه‌ی دوطرفه (متن/عکس/فایل/صدا/ویدیو، شامل فوروارد از "
+                f"کانال‌های دیگر) با این کاربر، دکمه‌ی زیر را بزنید.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ شروع مکالمه", callback_data=f"lic_start_{chat_id}")]
+                ])
+            )
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی درخواست لایسنس به ادمین: {e}")
+        await query.edit_message_text(
+            "✅ درخواست شما برای ادمین ارسال شد؛ به‌زودی مکالمه شروع می‌شود.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")]])
         )
 
@@ -979,29 +1300,29 @@ def get_morning_summary_users():
 # ─── منوها ────────────────────────────────────────────────────
 def reminder_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ تسک جدید", callback_data="rem_new")],
-        [InlineKeyboardButton("📋 لیست تسک‌ها", callback_data="rem_list")],
+        [InlineKeyboardButton("➕ تسک جدید", callback_data="rem_new"),
+         InlineKeyboardButton("📋 لیست تسک‌ها", callback_data="rem_list")],
         [InlineKeyboardButton("✅ انجام شده‌ها", callback_data="rem_done_list")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
 
 def repeat_type_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔂 یک‌بار", callback_data="rem_rep_once")],
-        [InlineKeyboardButton("🔁 هر روز", callback_data="rem_rep_daily")],
+        [InlineKeyboardButton("🔂 یک‌بار", callback_data="rem_rep_once"),
+         InlineKeyboardButton("🔁 هر روز", callback_data="rem_rep_daily")],
         [InlineKeyboardButton("📅 هر هفته", callback_data="rem_rep_weekly")],
     ])
 
 def alert_yes_no_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ بله", callback_data="rem_alert_yes")],
-        [InlineKeyboardButton("❌ خیر", callback_data="rem_alert_no")],
+        [InlineKeyboardButton("✅ بله", callback_data="rem_alert_yes"),
+         InlineKeyboardButton("❌ خیر", callback_data="rem_alert_no")],
     ])
 
 def alert_unit_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏱ دقیقه", callback_data="rem_unit_minute")],
-        [InlineKeyboardButton("🕐 ساعت", callback_data="rem_unit_hour")],
+        [InlineKeyboardButton("⏱ دقیقه", callback_data="rem_unit_minute"),
+         InlineKeyboardButton("🕐 ساعت", callback_data="rem_unit_hour")],
     ])
 
 REPEAT_LABELS = {"once": "یک‌بار", "daily": "هر روز", "weekly": "هر هفته"}
@@ -1372,23 +1693,23 @@ async def handle_ai_message(user_id, text, update):
 
 def kids_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 قصه جدید", callback_data="kids_story")],
-        [InlineKeyboardButton("✏️ تکالیف و مطالعه", callback_data="kids_homework")],
+        [InlineKeyboardButton("📖 قصه جدید", callback_data="kids_story"),
+         InlineKeyboardButton("✏️ تکالیف و مطالعه", callback_data="kids_homework")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
 
 def kids_homework_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 ثبت تکلیف جدید (با یادآور)", callback_data="kids_hw_add")],
-        [InlineKeyboardButton("📋 لیست تکالیف ثبت‌شده", callback_data="kids_hw_list")],
+        [InlineKeyboardButton("📝 ثبت تکلیف جدید (با یادآور)", callback_data="kids_hw_add"),
+         InlineKeyboardButton("📋 لیست تکالیف ثبت‌شده", callback_data="kids_hw_list")],
         [InlineKeyboardButton("🤖 کمک برای حل تمرین", callback_data="kids_hw_help")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="menu_kids")],
     ])
 
 def kids_gender_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👧 دختر", callback_data="kids_gender_girl")],
-        [InlineKeyboardButton("👦 پسر", callback_data="kids_gender_boy")],
+        [InlineKeyboardButton("👧 دختر", callback_data="kids_gender_girl"),
+         InlineKeyboardButton("👦 پسر", callback_data="kids_gender_boy")],
     ])
 
 def kids_story_source_menu():
@@ -2020,46 +2341,6 @@ def parse_music_caption(caption):
             title = line.replace("🎼", "").strip()
     return artist, title
 
-# ─── جستجو در منابع رایگان و قانونی (Jamendo API) ────────────
-# Jamendo: کاتالوگ +۵۰۰,۰۰۰ ترک با مجوز Creative Commons، رایگان
-# برای فعال‌سازی کامل: یک client_id رایگان از https://devportal.jamendo.com بگیرید
-# و در متغیر محیطی JAMENDO_CLIENT_ID قرار دهید. بدون آن، این بخش نتیجه‌ای برنمی‌گرداند
-# و مستقیماً به مرحله «اطلاع به ادمین» می‌رود (که همچنان کار می‌کند).
-JAMENDO_CLIENT_ID = os.environ.get("JAMENDO_CLIENT_ID", "")
-
-async def search_free_legal_music(query_text):
-    """
-    جستجو در Jamendo - فقط موزیک‌هایی با مجوز Creative Commons (کاملاً قانونی)
-    خروجی: (title, artist, download_url) یا None
-    """
-    if not JAMENDO_CLIENT_ID:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://api.jamendo.com/v3.0/tracks/",
-                params={
-                    "client_id": JAMENDO_CLIENT_ID,
-                    "format": "json",
-                    "limit": 1,
-                    "namesearch": query_text,
-                }
-            )
-            data = r.json()
-            results = data.get("results", [])
-            if not results:
-                return None
-            track = results[0]
-            title = track.get("name", "نامشخص")
-            artist = track.get("artist_name", "نامشخص")
-            download_url = track.get("audiodownload") or track.get("audio")
-            if not download_url:
-                return None
-            return title, artist, download_url
-    except Exception as e:
-        print(f"خطای جستجوی موزیک رایگان: {e}")
-        return None
-
 async def music_refine_query_with_ai(query_text):
     """
     از هوش مصنوعی می‌خواهد عبارت جستجوی آهنگ را دقیق‌تر کند (مثلاً حدس زدن
@@ -2646,18 +2927,7 @@ async def handle_fun_message(user_id, text, update):
             await update.message.reply_text("نتیجه پیدا شد ✅", reply_markup=music_menu())
             return True
 
-        # ۳) جستجو در Jamendo -- کاتالوگ بزرگ و کاملاً قانونی با مجوز Creative Commons
-        free_result = await search_free_legal_music(query_text)
-        if free_result:
-            title, artist, url = free_result
-            await update.message.reply_text(
-                f"🎵 پیدا شد (Jamendo -- مجوز Creative Commons، کاملاً رایگان و قانونی):\n\n"
-                f"🎼 {title}\n🎤 {artist}\n\n🔗 لینک دانلود مستقیم:\n{url}",
-                reply_markup=music_menu()
-            )
-            return True
-
-        # ۴) پیدا نشد در منابع رایگان -- با کمک هوش مصنوعی عبارت جستجو دقیق‌تر
+        # ۳) پیدا نشد در ایندکس داخلی -- با کمک هوش مصنوعی عبارت جستجو دقیق‌تر
         # می‌شود (مثلاً حدس اسم کامل خواننده/آلبوم)، سپس هر لینک جستجو قبل از
         # ارسال با یک درخواست HTTP واقعی تست می‌شود؛ فقط لینک‌هایی که واقعاً
         # از سمت سرور در دسترس بودند فرستاده می‌شوند (نه فقط ساخته می‌شوند)
@@ -2727,8 +2997,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def tools_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 دستیار هوش مصنوعی", callback_data="menu_ai")],
-        [InlineKeyboardButton("🛡 فیلترشکن", callback_data="menu_antifilter")],  # ← حذف ماژول فیلترشکن = پاک کن این خط
+        [InlineKeyboardButton("🤖 دستیار هوش مصنوعی", callback_data="menu_ai"),
+         InlineKeyboardButton("🛡 فیلترشکن", callback_data="menu_antifilter")],  # ← حذف ماژول فیلترشکن = پاک کن این خط
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
 
@@ -2810,21 +3080,21 @@ def mark_user_admin_message_replied(message_id):
 
 def settings_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 پروفایل من", callback_data="set_profile")],
-        [InlineKeyboardButton("✏️ تکمیل پروفایل", callback_data="set_complete_profile")],
-        [InlineKeyboardButton("📅 تاریخ انقضا", callback_data="set_expiry")],
-        [InlineKeyboardButton("📩 پیام به ادمین", callback_data="set_msg_admin")],  # ← حذف فیچر پیام به ادمین = پاک کن این خط
+        [InlineKeyboardButton("👤 پروفایل من", callback_data="set_profile"),
+         InlineKeyboardButton("✏️ تکمیل پروفایل", callback_data="set_complete_profile")],
+        [InlineKeyboardButton("📅 تاریخ انقضا", callback_data="set_expiry"),
+         InlineKeyboardButton("📩 پیام به ادمین", callback_data="set_msg_admin")],  # ← حذف فیچر پیام به ادمین = پاک کن این خط
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
 
 def profile_complete_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📧 ثبت/ویرایش ایمیل", callback_data="set_email")],
-        [InlineKeyboardButton("📱 ثبت/ویرایش شماره تلفن", callback_data="set_phone")],
-        [InlineKeyboardButton("🎂 ثبت/ویرایش تاریخ تولد", callback_data="set_birthdate")],  # ← حذف فیلدهای پروفایل تکمیلی = این ۳ خط را پاک کن
-        [InlineKeyboardButton("🏙 ثبت/ویرایش شهر", callback_data="set_city")],
-        [InlineKeyboardButton("🌍 ثبت/ویرایش کشور", callback_data="set_country")],
-        [InlineKeyboardButton("💼 ثبت/ویرایش شغل", callback_data="set_occupation")],
+        [InlineKeyboardButton("📧 ثبت/ویرایش ایمیل", callback_data="set_email"),
+         InlineKeyboardButton("📱 ثبت/ویرایش شماره تلفن", callback_data="set_phone")],
+        [InlineKeyboardButton("🎂 ثبت/ویرایش تاریخ تولد", callback_data="set_birthdate"),  # ← حذف فیلدهای پروفایل تکمیلی = این ۳ خط را پاک کن
+         InlineKeyboardButton("🏙 ثبت/ویرایش شهر", callback_data="set_city")],
+        [InlineKeyboardButton("🌍 ثبت/ویرایش کشور", callback_data="set_country"),
+         InlineKeyboardButton("💼 ثبت/ویرایش شغل", callback_data="set_occupation")],
         [InlineKeyboardButton("🔔 فعال/غیرفعال کردن هشدار ایمیلی", callback_data="set_toggle_email_alerts")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="menu_settings")],
     ])
@@ -3100,8 +3370,8 @@ async def antifilter_fetch_proxy_list():
 def antifilter_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 دریافت ۵ پروکسی تلگرام", callback_data="af_proxies")],
-        [InlineKeyboardButton("📱 دانلود Psiphon", callback_data="af_psiphon")],
-        [InlineKeyboardButton("📱 دانلود Soren VPN", callback_data="af_soren")],
+        [InlineKeyboardButton("📱 دانلود Psiphon", callback_data="af_psiphon"),
+         InlineKeyboardButton("📱 دانلود Soren VPN", callback_data="af_soren")],
         [InlineKeyboardButton("📱 دانلود JamJam VPN", callback_data="af_jamjam")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="menu_tools")],
     ])
@@ -3309,14 +3579,55 @@ STATUS_LABELS = {"active": "✅ فعال", "pending": "⏳ در انتظار", "
 
 def admin_panel_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 آمار کلی", callback_data="adm_stats")],
-        [InlineKeyboardButton("👥 لیست کاربران", callback_data="adm_users")],
-        [InlineKeyboardButton("📥 خروجی اکسل کاربران", callback_data="adm_export_users")],  # ← حذف = پاک کن این خط
+        [InlineKeyboardButton("📊 آمار کلی", callback_data="adm_stats"),
+         InlineKeyboardButton("👥 لیست کاربران", callback_data="adm_users")],
+        [InlineKeyboardButton("📥 خروجی اکسل کاربران", callback_data="adm_export_users"),  # ← حذف = پاک کن این خط
+         InlineKeyboardButton("📝 لاگ درخواست‌های ناموفق", callback_data="adm_failed")],
         [InlineKeyboardButton("📢 ارسال پیام به کاربران", callback_data="adm_broadcast_menu")],
         [InlineKeyboardButton("📶 لیست اندیکاتورهای شخصی ارسالی", callback_data="adm_indicators")],
-        [InlineKeyboardButton("📝 لاگ درخواست‌های ناموفق", callback_data="adm_failed")],
+        [InlineKeyboardButton("📁 کتابخانه‌ی فایل و متن", callback_data="adm_library")],  # ← حذف کتابخانه = پاک کن این خط
         [InlineKeyboardButton("🔎 مدیریت سریع یک کاربر (با آیدی)", callback_data="adm_manage_user")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
+    ])
+
+def admin_library_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 فایل نسخه‌ی تست", callback_data="adm_set_trial_file"),  # ← حذف کتابخانه = پاک کن این خط
+         InlineKeyboardButton("💳 فایل نسخه‌ی پولی", callback_data="adm_set_paid_file")],
+        [InlineKeyboardButton("📚 فایل‌های آماده (حداکثر ۱۰)", callback_data="adm_files_list"),
+         InlineKeyboardButton("💬 متن‌های آماده", callback_data="adm_texts_list")],
+        [InlineKeyboardButton("💰 متن قیمت‌گذاری لایسنس", callback_data="adm_set_pricing_text")],  # ← حذف = پاک کن این خط
+        [InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")],
+    ])
+
+def admin_files_list_menu():
+    files = get_admin_files()
+    rows = [[InlineKeyboardButton(f"📄 {label}", callback_data=f"adm_file_view_{fid}")]
+            for fid, label, *_rest in files]
+    if len(files) < 10:
+        rows.append([InlineKeyboardButton("➕ افزودن فایل جدید", callback_data="adm_files_add")])
+    rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")])
+    return InlineKeyboardMarkup(rows), len(files)
+
+def admin_texts_list_menu():
+    texts = get_admin_texts()
+    rows = [[InlineKeyboardButton(f"💬 {label}", callback_data=f"adm_text_view_{tid}")]
+            for tid, label, _content in texts]
+    rows.append([InlineKeyboardButton("➕ افزودن متن جدید", callback_data="adm_texts_add")])
+    rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")])
+    return InlineKeyboardMarkup(rows)
+
+def license_chat_action_menu(chat_id):
+    """
+    دکمه‌های سریع در حین چت زنده‌ی لایسنس -- علاوه بر پایان مکالمه،
+    امکان ارسال فوری فایل نسخه‌ی پولی، انتخاب از کتابخانه‌ی فایل‌های
+    آماده، یا انتخاب از متن‌های آماده، بدون خروج از مکالمه.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 ارسال فایل نسخه‌ی پولی", callback_data=f"lic_send_paid_{chat_id}")],
+        [InlineKeyboardButton("📚 ارسال فایل آماده", callback_data=f"lic_pick_file_{chat_id}"),
+         InlineKeyboardButton("💬 ارسال متن آماده", callback_data=f"lic_pick_text_{chat_id}")],
+        [InlineKeyboardButton("🔚 پایان مکالمه", callback_data=f"lic_end_{chat_id}")],
     ])
 
 async def handle_admin_panel(query, user_id, context):
@@ -3481,6 +3792,150 @@ async def handle_admin_panel(query, user_id, context):
         text = "📝 آخرین درخواست‌های ناموفق:\n\n" + "\n".join(lines)
         await query.edit_message_text(text[:4000], reply_markup=admin_panel_menu())
 
+    elif data == "adm_library":  # ← حذف کتابخانه = پاک کن این بلوک
+        await query.edit_message_text("📁 کتابخانه‌ی فایل و متن:", reply_markup=admin_library_menu())
+
+    elif data == "adm_set_pricing_text":  # ← حذف = پاک کن این بلوک
+        set_state(user_id, "adm_awaiting_pricing_text")
+        current = get_bot_setting("pricing_text")
+        preview = f"\n\nمتن فعلی:\n\n{current}" if current else "\n\n(هنوز متنی تنظیم نشده؛ فعلاً یک متن پیش‌فرض عمومی نمایش داده می‌شود.)"
+        full_text = (
+            f"💰 متن جدید قیمت‌گذاری لایسنس را بنویسید (شامل قیمت‌های ۳/۶/۱۲ ماهه و روش پرداخت). "
+            f"همین متن دقیقاً به کاربر نمایش داده می‌شود.{preview}"
+        )[:4000]
+        await query.edit_message_text(
+            full_text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")]])
+        )
+
+    elif data == "adm_set_trial_file":
+        set_state(user_id, "adm_awaiting_trial_file_content")
+        current = get_bot_setting("trial_file")
+        status_line = "\n\n(الان یک فایل تنظیم‌شده دارید؛ با ارسال محتوای جدید جایگزین می‌شود.)" if current else ""
+        await query.edit_message_text(
+            "🎁 متن، عکس، فایل، صدا یا ویدیوی نسخه‌ی تست را همین‌جا بفرستید. "
+            "این محتوا ذخیره می‌شود و از این پس هر کاربری که «دریافت نسخه تست» را بزند، "
+            f"خودکار همین را دریافت می‌کند.{status_line}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")]])
+        )
+
+    elif data == "adm_set_paid_file":
+        set_state(user_id, "adm_awaiting_paid_file_content")
+        current = get_bot_setting("paid_file")
+        status_line = "\n\n(الان یک فایل تنظیم‌شده دارید؛ با ارسال محتوای جدید جایگزین می‌شود.)" if current else ""
+        await query.edit_message_text(
+            "💳 متن، عکس، فایل، صدا یا ویدیوی نسخه‌ی پولی را همین‌جا بفرستید. این محتوا "
+            "ذخیره می‌شود و در حین چت زنده‌ی لایسنس، با یک دکمه قابل ارسال فوری برای "
+            f"کاربر خواهد بود.{status_line}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")]])
+        )
+
+    elif data == "adm_files_list":
+        menu, count = admin_files_list_menu()
+        await query.edit_message_text(f"📚 فایل‌های آماده ({count}/10):", reply_markup=menu)
+
+    elif data == "adm_files_add":
+        if count_admin_files() >= 10:
+            await query.answer("⛔ در حال حاضر ۱۰ فایل ثبت شده (حداکثر مجاز)؛ اول یکی را حذف کنید.", show_alert=True)
+            return
+        set_state(user_id, "adm_awaiting_new_file_label")
+        await query.edit_message_text(
+            "یک اسم کوتاه برای این فایل بنویسید (برای شناسایی سریع بعداً، مثلاً «بروشور فارسی»):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="adm_files_list")]])
+        )
+
+    elif data.startswith("adm_file_view_"):
+        file_db_id = int(data.replace("adm_file_view_", ""))
+        row = get_admin_file(file_db_id)
+        if not row:
+            await query.answer("این فایل پیدا نشد.", show_alert=True)
+            return
+        label, file_type, file_id, caption = row
+        await query.edit_message_text(
+            f"📄 {label}\nنوع: {file_type}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👁 پیش‌نمایش (ارسال برای خودم)", callback_data=f"adm_file_preview_{file_db_id}")],
+                [InlineKeyboardButton("🗑 حذف", callback_data=f"adm_file_del_{file_db_id}")],
+                [InlineKeyboardButton("🔙 برگشت", callback_data="adm_files_list")],
+            ])
+        )
+
+    elif data.startswith("adm_file_preview_"):
+        file_db_id = int(data.replace("adm_file_preview_", ""))
+        row = get_admin_file(file_db_id)
+        if not row:
+            await query.answer("این فایل پیدا نشد.", show_alert=True)
+            return
+        label, file_type, file_id, caption = row
+        await send_content_by_type(context, ADMIN_ID, file_type, file_id, caption, default_caption=label)
+        await query.answer("✅ برای شما ارسال شد.")
+
+    elif data.startswith("adm_file_del_"):
+        file_db_id = int(data.replace("adm_file_del_", ""))
+        delete_admin_file(file_db_id)
+        menu, count = admin_files_list_menu()
+        await query.edit_message_text(f"✅ حذف شد.\n\n📚 فایل‌های آماده ({count}/10):", reply_markup=menu)
+
+    elif data == "adm_texts_list":
+        texts = get_admin_texts()
+        if not texts:
+            await query.edit_message_text(
+                "💬 هنوز متنی ثبت نشده.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ افزودن متن جدید", callback_data="adm_texts_add")],
+                    [InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")],
+                ])
+            )
+            return
+        await query.edit_message_text("💬 متن‌های آماده:", reply_markup=admin_texts_list_menu())
+
+    elif data == "adm_texts_add":
+        set_state(user_id, "adm_awaiting_new_text_label")
+        await query.edit_message_text(
+            "یک اسم کوتاه برای این متن بنویسید (مثلاً «شماره حساب تتر» یا «سوال: نحوه واریز»):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="adm_texts_list")]])
+        )
+
+    elif data.startswith("adm_text_view_"):
+        text_id = int(data.replace("adm_text_view_", ""))
+        row = get_admin_text(text_id)
+        if not row:
+            await query.answer("این متن پیدا نشد.", show_alert=True)
+            return
+        label, content = row
+        await query.edit_message_text(
+            f"💬 {label}\n\n{content}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ ویرایش", callback_data=f"adm_text_edit_{text_id}")],
+                [InlineKeyboardButton("🗑 حذف", callback_data=f"adm_text_del_{text_id}")],
+                [InlineKeyboardButton("🔙 برگشت", callback_data="adm_texts_list")],
+            ])
+        )
+
+    elif data.startswith("adm_text_edit_"):
+        text_id = int(data.replace("adm_text_edit_", ""))
+        row = get_admin_text(text_id)
+        if not row:
+            await query.answer("این متن پیدا نشد.", show_alert=True)
+            return
+        set_state(user_id, "adm_awaiting_edit_text_content", str(text_id))
+        await query.edit_message_text("متن جدید را بنویسید (جایگزین متن قبلی می‌شود؛ اسم همان قبلی باقی می‌ماند):")
+
+    elif data.startswith("adm_text_del_"):
+        text_id = int(data.replace("adm_text_del_", ""))
+        delete_admin_text(text_id)
+        texts = get_admin_texts()
+        if not texts:
+            await query.edit_message_text(
+                "✅ حذف شد.\n\n💬 هنوز متنی ثبت نشده.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ افزودن متن جدید", callback_data="adm_texts_add")],
+                    [InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")],
+                ])
+            )
+            return
+        await query.edit_message_text("✅ حذف شد.\n\n💬 متن‌های آماده:", reply_markup=admin_texts_list_menu())
+
     elif data == "adm_manage_user":
         set_state(user_id, "adm_awaiting_user_id")
         await query.edit_message_text(
@@ -3558,6 +4013,45 @@ async def handle_admin_panel_message(user_id, text, update):
             return True
         set_state(user_id, "adm_awaiting_broadcast_text", str(target_id))
         await update.message.reply_text("✅ آیدی ثبت شد.\n\nحالا متن پیام را بنویسید:")
+        return True
+
+    elif state == "adm_awaiting_pricing_text":  # ← حذف = پاک کن این بلوک
+        set_bot_setting("pricing_text", text.strip())
+        clear_state(user_id)
+        await update.message.reply_text("✅ متن قیمت‌گذاری ذخیره شد.", reply_markup=admin_library_menu())
+        return True
+
+    elif state == "adm_awaiting_new_file_label":  # ← حذف کتابخانه = پاک کن این ۴ بلوک elif
+        label = text.strip()[:60]
+        set_state(user_id, "adm_awaiting_new_file_content", label)
+        await update.message.reply_text(f"حالا متن، عکس، فایل، صدا یا ویدیوی «{label}» را بفرستید:")
+        return True
+
+    elif state == "adm_awaiting_new_text_label":
+        label = text.strip()[:60]
+        set_state(user_id, "adm_awaiting_new_text_content", label)
+        await update.message.reply_text(f"حالا متن «{label}» را بنویسید:")
+        return True
+
+    elif state == "adm_awaiting_new_text_content":
+        label = data
+        content = text.strip()
+        add_admin_text(label, content)
+        clear_state(user_id)
+        await update.message.reply_text(f"✅ متن «{label}» به کتابخانه اضافه شد.", reply_markup=admin_library_menu())
+        return True
+
+    elif state == "adm_awaiting_edit_text_content":
+        text_id = int(data)
+        row = get_admin_text(text_id)
+        if not row:
+            clear_state(user_id)
+            await update.message.reply_text("❌ این متن دیگر وجود ندارد.", reply_markup=admin_library_menu())
+            return True
+        label, _old_content = row
+        update_admin_text(text_id, label, text.strip())
+        clear_state(user_id)
+        await update.message.reply_text(f"✅ متن «{label}» به‌روزرسانی شد.", reply_markup=admin_library_menu())
         return True
 
     if state == "adm_awaiting_user_id":
@@ -3908,8 +4402,8 @@ async def run_market_analysis_for_user(bot, user_id, analysis_type):
 
 def market_ai_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📌 تحلیل نمادهای ثابت", callback_data="aim_type_fixed")],
-        [InlineKeyboardButton("👁 تحلیل واچ‌لیست شخصی", callback_data="aim_type_watchlist")],
+        [InlineKeyboardButton("📌 تحلیل نمادهای ثابت", callback_data="aim_type_fixed"),
+         InlineKeyboardButton("👁 تحلیل واچ‌لیست شخصی", callback_data="aim_type_watchlist")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")],
     ])
 
@@ -4132,14 +4626,14 @@ def position_size_menu():
 
 def ps_direction_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📈 Long (خرید)", callback_data="ps_dir_long")],
-        [InlineKeyboardButton("📉 Short (فروش)", callback_data="ps_dir_short")],
+        [InlineKeyboardButton("📈 Long (خرید)", callback_data="ps_dir_long"),
+         InlineKeyboardButton("📉 Short (فروش)", callback_data="ps_dir_short")],
     ])
 
 def ps_risk_type_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💵 مقدار دلاری ثابت", callback_data="ps_risk_fixed")],
-        [InlineKeyboardButton("📊 درصدی از بالانس", callback_data="ps_risk_percent")],
+        [InlineKeyboardButton("💵 مقدار دلاری ثابت", callback_data="ps_risk_fixed"),
+         InlineKeyboardButton("📊 درصدی از بالانس", callback_data="ps_risk_percent")],
     ])
 
 # ─── هندلر دکمه‌ها ────────────────────────────────────────────
@@ -4585,8 +5079,8 @@ def build_excel_report(rows):
 # ─── منوها ────────────────────────────────────────────────────
 def backtest_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ بک‌تست جدید", callback_data="bt_new")],
-        [InlineKeyboardButton("📁 آپلود فایل لیست معاملات", callback_data="bt_upload")],  # ← حذف = پاک کن این خط
+        [InlineKeyboardButton("➕ بک‌تست جدید", callback_data="bt_new"),
+         InlineKeyboardButton("📁 آپلود فایل لیست معاملات", callback_data="bt_upload")],  # ← حذف = پاک کن این خط
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")],
     ])
 
@@ -4601,14 +5095,14 @@ def strategy_choice_menu(user_id):
 
 def r_level_question_menu(r_mult):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ بله، جابجا کن", callback_data=f"bt_r_yes_{r_mult}")],
-        [InlineKeyboardButton("❌ نه، رد شو", callback_data=f"bt_r_no_{r_mult}")],
+        [InlineKeyboardButton("✅ بله، جابجا کن", callback_data=f"bt_r_yes_{r_mult}"),
+         InlineKeyboardButton("❌ نه، رد شو", callback_data=f"bt_r_no_{r_mult}")],
     ])
 
 def direction_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📈 Long (خرید)", callback_data="bt_dir_long")],
-        [InlineKeyboardButton("📉 Short (فروش)", callback_data="bt_dir_short")],
+        [InlineKeyboardButton("📈 Long (خرید)", callback_data="bt_dir_long"),
+         InlineKeyboardButton("📉 Short (فروش)", callback_data="bt_dir_short")],
     ])
 
 def timeframe_menu():
@@ -5118,8 +5612,8 @@ def bt_upload_sample_menu():
 
 def bt_upload_timeframe_common_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1 دقیقه", callback_data="btu_tf_1m")],
-        [InlineKeyboardButton("15 دقیقه", callback_data="btu_tf_15m")],
+        [InlineKeyboardButton("1 دقیقه", callback_data="btu_tf_1m"),
+         InlineKeyboardButton("15 دقیقه", callback_data="btu_tf_15m")],
         [InlineKeyboardButton("1 ساعت", callback_data="btu_tf_1h")],
         [InlineKeyboardButton("📄 هر ردیف تایم‌فریم خودش را دارد (ستون فایل)", callback_data="btu_tf_percolumn")],
     ])
@@ -6089,14 +6583,14 @@ def indicator_list_menu():
 
 def indicator_management_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔹 فقط سیگنال ساده", callback_data="ib_mgmt_simple")],
-        [InlineKeyboardButton("🔸 با مدیریت پوزیشن (R)", callback_data="ib_mgmt_full")],
+        [InlineKeyboardButton("🔹 فقط سیگنال ساده", callback_data="ib_mgmt_simple"),
+         InlineKeyboardButton("🔸 با مدیریت پوزیشن (R)", callback_data="ib_mgmt_full")],
     ])
 
 def indicator_timeframe_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1 دقیقه", callback_data="ib_tf_1m")],
-        [InlineKeyboardButton("15 دقیقه", callback_data="ib_tf_15m")],
+        [InlineKeyboardButton("1 دقیقه", callback_data="ib_tf_1m"),
+         InlineKeyboardButton("15 دقیقه", callback_data="ib_tf_15m")],
         [InlineKeyboardButton("1 ساعت", callback_data="ib_tf_1h")],
     ])
 
@@ -6108,15 +6602,15 @@ def indicator_result_menu():
 
 def sl_unit_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 درصد از قیمت ورود", callback_data="ib_sl_unit_percent")],
-        [InlineKeyboardButton("💵 مقدار دلاری ثابت", callback_data="ib_sl_unit_dollar")],
+        [InlineKeyboardButton("📊 درصد از قیمت ورود", callback_data="ib_sl_unit_percent"),
+         InlineKeyboardButton("💵 مقدار دلاری ثابت", callback_data="ib_sl_unit_dollar")],
         [InlineKeyboardButton("📏 تعداد پیپ (فقط فارکس)", callback_data="ib_sl_unit_pip")],
     ])
 
 def ib_r_level_question_menu(r_mult):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ بله، جابجا کن", callback_data=f"ib_r_yes_{r_mult}")],
-        [InlineKeyboardButton("❌ نه، رد شو", callback_data=f"ib_r_no_{r_mult}")],
+        [InlineKeyboardButton("✅ بله، جابجا کن", callback_data=f"ib_r_yes_{r_mult}"),
+         InlineKeyboardButton("❌ نه، رد شو", callback_data=f"ib_r_no_{r_mult}")],
     ])
 
 # ─── هندلر دکمه‌ها ────────────────────────────────────────────
@@ -6849,8 +7343,8 @@ def get_custom_indicator_by_id(cid):
 # ─── منوها ────────────────────────────────────────────────────
 def custom_indicator_entry_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 کد پایتون دارم", callback_data="ci_have_code")],
-        [InlineKeyboardButton("💬 کد ندارم، توضیح می‌دهم", callback_data="ci_no_code")],
+        [InlineKeyboardButton("📄 کد پایتون دارم", callback_data="ci_have_code"),
+         InlineKeyboardButton("💬 کد ندارم، توضیح می‌دهم", callback_data="ci_no_code")],
         [InlineKeyboardButton("📋 اندیکاتورهای شخصی من", callback_data="ci_my_list")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")],
     ])
@@ -7339,13 +7833,160 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📤 متن، عکس، فایل، صدا یا ویدیوی پاسخ را همین‌جا بفرستید تا خودکار برای کاربر ارسال شود."
         )
 
+    elif data.startswith("lic_start_"):  # ← حذف فیچر چت لایسنس = پاک کن این بلوک
+        if user_id != ADMIN_ID:
+            await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
+            return
+        chat_id = int(data.replace("lic_start_", ""))
+        chat_row = get_license_chat(chat_id)
+        if not chat_row:
+            await query.answer("این درخواست پیدا نشد.", show_alert=True)
+            return
+        target_user_id, status = chat_row
+        if status == "closed":
+            await query.answer("این مکالمه قبلاً بسته شده.", show_alert=True)
+            return
+        update_license_chat_status(chat_id, "active")
+        set_state(ADMIN_ID, "admin_chat_active", f"{chat_id}:{target_user_id}")
+        set_state(target_user_id, "user_chat_active", str(chat_id))
+        try:
+            await context.bot.send_message(
+                target_user_id,
+                "✅ ادمین مکالمه را شروع کرد؛ از همین‌جا می‌توانید متن، عکس، فایل، صدا "
+                "یا ویدیو مستقیم بفرستید."
+            )
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی شروع مکالمه به کاربر: {e}")
+        await query.edit_message_text(
+            "✅ مکالمه شروع شد. از همین‌جا هرچه بفرستید (حتی فوروارد از کانال دیگر) "
+            "مستقیم برای کاربر می‌رود؛ یا از دکمه‌های زیر برای ارسال سریع فایل/متن آماده استفاده کنید.",
+            reply_markup=license_chat_action_menu(chat_id)
+        )
+
+    elif data.startswith("lic_end_"):  # ← حذف فیچر چت لایسنس = پاک کن این بلوک
+        if user_id != ADMIN_ID:
+            await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
+            return
+        chat_id = int(data.replace("lic_end_", ""))
+        chat_row = get_license_chat(chat_id)
+        if not chat_row:
+            await query.answer("این مکالمه پیدا نشد.", show_alert=True)
+            return
+        target_user_id, status = chat_row
+        update_license_chat_status(chat_id, "closed")
+        clear_state(ADMIN_ID)
+        clear_state(target_user_id)
+        await query.edit_message_text("✅ مکالمه بسته شد.")
+        try:
+            await context.bot.send_message(
+                target_user_id,
+                "🔒 مکالمه با ادمین بسته شد. در صورت نیاز دوباره از منوی «ربات مدیریت سرمایه» اقدام کنید."
+            )
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی پایان مکالمه به کاربر: {e}")
+
+    elif data.startswith("lic_send_paid_"):  # ← حذف کتابخانه/چت لایسنس = پاک کن این بلوک
+        if user_id != ADMIN_ID:
+            await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
+            return
+        chat_id = int(data.replace("lic_send_paid_", ""))
+        chat_row = get_license_chat(chat_id)
+        if not chat_row or chat_row[1] == "closed":
+            await query.answer("این مکالمه دیگر فعال نیست.", show_alert=True)
+            return
+        target_user_id = chat_row[0]
+        paid_setting = get_bot_setting("paid_file")
+        if not paid_setting:
+            await query.answer("هنوز فایل نسخه‌ی پولی از پنل مدیریت تنظیم نشده.", show_alert=True)
+            return
+        import json
+        info = json.loads(paid_setting)
+        sent = await send_content_by_type(
+            context, target_user_id, info["file_type"], info.get("file_id"), info.get("caption"),
+            default_caption="💳 نسخه‌ی پولی ربات مدیریت سرمایه"
+        )
+        if sent:
+            await query.answer("✅ ارسال شد.")
+            await query.message.reply_text("✅ فایل نسخه‌ی پولی برای کاربر ارسال شد.", reply_markup=license_chat_action_menu(chat_id))
+        else:
+            await query.answer("❌ خطا در ارسال.", show_alert=True)
+
+    elif data.startswith("lic_pick_file_"):
+        chat_id = int(data.replace("lic_pick_file_", ""))
+        files = get_admin_files()
+        if not files:
+            await query.answer("هنوز فایلی در کتابخانه ثبت نشده.", show_alert=True)
+            return
+        rows = [[InlineKeyboardButton(f"📄 {label}", callback_data=f"lic_sendfile_{chat_id}_{fid}")]
+                for fid, label, *_rest in files]
+        rows.append([InlineKeyboardButton("🔙 برگشت", callback_data=f"lic_back_{chat_id}")])
+        await query.edit_message_text("📚 کدام فایل ارسال شود؟", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data.startswith("lic_sendfile_"):
+        remainder = data.replace("lic_sendfile_", "")
+        chat_id_str, file_db_id_str = remainder.split("_")
+        chat_id, file_db_id = int(chat_id_str), int(file_db_id_str)
+        chat_row = get_license_chat(chat_id)
+        if not chat_row or chat_row[1] == "closed":
+            await query.answer("این مکالمه دیگر فعال نیست.", show_alert=True)
+            return
+        target_user_id = chat_row[0]
+        row = get_admin_file(file_db_id)
+        if not row:
+            await query.answer("این فایل پیدا نشد.", show_alert=True)
+            return
+        label, file_type, file_id, caption = row
+        sent = await send_content_by_type(context, target_user_id, file_type, file_id, caption, default_caption=label)
+        if sent:
+            await query.edit_message_text(f"✅ «{label}» برای کاربر ارسال شد.", reply_markup=license_chat_action_menu(chat_id))
+        else:
+            await query.answer("❌ خطا در ارسال.", show_alert=True)
+
+    elif data.startswith("lic_pick_text_"):
+        chat_id = int(data.replace("lic_pick_text_", ""))
+        texts = get_admin_texts()
+        if not texts:
+            await query.answer("هنوز متنی در کتابخانه ثبت نشده.", show_alert=True)
+            return
+        rows = [[InlineKeyboardButton(f"💬 {label}", callback_data=f"lic_sendtext_{chat_id}_{tid}")]
+                for tid, label, _content in texts]
+        rows.append([InlineKeyboardButton("🔙 برگشت", callback_data=f"lic_back_{chat_id}")])
+        await query.edit_message_text("💬 کدام متن ارسال شود؟", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data.startswith("lic_sendtext_"):
+        remainder = data.replace("lic_sendtext_", "")
+        chat_id_str, text_id_str = remainder.split("_")
+        chat_id, text_id = int(chat_id_str), int(text_id_str)
+        chat_row = get_license_chat(chat_id)
+        if not chat_row or chat_row[1] == "closed":
+            await query.answer("این مکالمه دیگر فعال نیست.", show_alert=True)
+            return
+        target_user_id = chat_row[0]
+        row = get_admin_text(text_id)
+        if not row:
+            await query.answer("این متن پیدا نشد.", show_alert=True)
+            return
+        label, content = row
+        try:
+            await context.bot.send_message(target_user_id, content)
+            await query.edit_message_text(f"✅ متن «{label}» برای کاربر ارسال شد.", reply_markup=license_chat_action_menu(chat_id))
+        except Exception as e:
+            await query.answer(f"❌ خطا در ارسال: {e}", show_alert=True)
+
+    elif data.startswith("lic_back_"):
+        chat_id = int(data.replace("lic_back_", ""))
+        await query.edit_message_text(
+            "💬 در حال مکالمه. از دکمه‌ها استفاده کنید یا مستقیم پیام بفرستید.",
+            reply_markup=license_chat_action_menu(chat_id)
+        )
+
     elif data == "menu_ai_market" or data.startswith("aim_"):
         await handle_market_ai(query, user_id, context)  # ← حذف ماژول تحلیل بازار = پاک کن این خط
 
     elif data == "fin_news":
         await handle_forex_news(query, user_id)  # ← حذف ماژول اخبار = پاک کن این خط
 
-    elif data.startswith("menu_financial") or data.startswith("fin_") or data.startswith("wl_") or data.startswith("alarm_") or data.startswith("back_financial"):
+    elif data.startswith("menu_financial") or data.startswith("fin_") or data.startswith("wl_") or data.startswith("alarm_") or data.startswith("back_financial") or data.startswith("cap_"):
         await handle_financial(query, user_id, context)  # ← حذف ماژول = پاک کن این خط
 
     elif data.startswith("menu_reminder") or data.startswith("rem_"):
@@ -7388,9 +8029,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = text_raw
     state, _ = get_state(user_id)
 
-    if user_id == ADMIN_ID and state in ("admin_awaiting_capital_content", "admin_awaiting_reply_content"):  # ← حذف ماژول ربات مدیریت سرمایه/پیام به ادمین = پاک کن این خط
-        await handle_admin_generic_content(update, context)
-        return
+    if state in ("admin_awaiting_capital_content", "admin_awaiting_reply_content", "adm_awaiting_trial_file_content",
+                  "adm_awaiting_paid_file_content", "adm_awaiting_new_file_content",
+                  "admin_chat_active", "user_chat_active"):  # ← حذف ماژول ربات مدیریت سرمایه/پیام به ادمین/چت لایسنس/کتابخانه = پاک کن این خط
+        handled = await handle_admin_generic_content(update, context)
+        if handled:
+            return
 
     if state in ["wl_add", "alarm_symbol", "alarm_price"]:
         await handle_financial_message(user_id, text, update)  # ← حذف ماژول = پاک کن این خط
@@ -7510,39 +8154,22 @@ async def handle_admin_capital_content(update, context):
         [InlineKeyboardButton("✅ پایان ارسال", callback_data=f"admin_finish_capital_{request_id}")]
     ])
 
-    try:
-        if msg.document:
-            await context.bot.send_document(chat_id=requester_user_id, document=msg.document.file_id,
-                                              caption=msg.caption or default_caption)
-        elif msg.photo:
-            await context.bot.send_photo(chat_id=requester_user_id, photo=msg.photo[-1].file_id,
-                                          caption=msg.caption or default_caption)
-        elif msg.audio:
-            await context.bot.send_audio(chat_id=requester_user_id, audio=msg.audio.file_id,
-                                          caption=msg.caption or default_caption)
-        elif msg.video:
-            await context.bot.send_video(chat_id=requester_user_id, video=msg.video.file_id,
-                                          caption=msg.caption or default_caption)
-        elif msg.voice:
-            await context.bot.send_voice(chat_id=requester_user_id, voice=msg.voice.file_id,
-                                          caption=msg.caption or default_caption)
-        elif msg.text:
-            await context.bot.send_message(chat_id=requester_user_id, text=f"{default_caption}\n\n{msg.text}")
-        else:
-            await update.message.reply_text(
-                "❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.",
-                reply_markup=finish_button
-            )
-            return True
+    prefix = f"{default_caption}\n\n"  # relay_free_message خودش برای متن، رسانه‌ی بدون کپشن، و
+                                        # رسانه‌ی دارای کپشن به‌درستی از این استفاده می‌کند
+    sent = await relay_free_message(msg, context, requester_user_id, prefix=prefix)
 
-        mark_capital_request_fulfilled(request_id)
+    if not sent:
         await update.message.reply_text(
-            "✅ برای کاربر ارسال شد. می‌توانید پیام بعدی را بفرستید یا پایان بدهید.",
+            "❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.",
             reply_markup=finish_button
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در ارسال به کاربر: {e}", reply_markup=finish_button)
+        return True
 
+    mark_capital_request_fulfilled(request_id)
+    await update.message.reply_text(
+        "✅ برای کاربر ارسال شد. می‌توانید پیام بعدی را بفرستید یا پایان بدهید.",
+        reply_markup=finish_button
+    )
     return True
 
 async def handle_admin_reply_content(update, context):
@@ -7571,49 +8198,145 @@ async def handle_admin_reply_content(update, context):
 
     msg = update.message
     default_caption = "📩 پاسخ ادمین به پیام شما:"
+    prefix = f"{default_caption}\n\n"
 
-    try:
-        if msg.document:
-            await context.bot.send_document(chat_id=target_user_id, document=msg.document.file_id,
-                                              caption=msg.caption or default_caption)
-        elif msg.photo:
-            await context.bot.send_photo(chat_id=target_user_id, photo=msg.photo[-1].file_id,
-                                          caption=msg.caption or default_caption)
-        elif msg.audio:
-            await context.bot.send_audio(chat_id=target_user_id, audio=msg.audio.file_id,
-                                          caption=msg.caption or default_caption)
-        elif msg.video:
-            await context.bot.send_video(chat_id=target_user_id, video=msg.video.file_id,
-                                          caption=msg.caption or default_caption)
-        elif msg.voice:
-            await context.bot.send_voice(chat_id=target_user_id, voice=msg.voice.file_id,
-                                          caption=msg.caption or default_caption)
-        elif msg.text:
-            await context.bot.send_message(chat_id=target_user_id, text=f"{default_caption}\n\n{msg.text}")
-        else:
-            await update.message.reply_text(
-                "❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید."
-            )
-            return True
+    sent = await relay_free_message(msg, context, target_user_id, prefix=prefix)
+    if not sent:
+        await update.message.reply_text(
+            "❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید."
+        )
+        return True
 
-        mark_user_admin_message_replied(message_id)
-        await update.message.reply_text("✅ پاسخ برای کاربر ارسال شد.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در ارسال پاسخ: {e}")
-
+    mark_user_admin_message_replied(message_id)
+    await update.message.reply_text("✅ پاسخ برای کاربر ارسال شد.")
     clear_state(ADMIN_ID)
     return True
 
+async def handle_admin_keyed_file_upload(update, context):
+    """
+    آپلود محتوای ادمین برای یکی از دو «اسلات ثابت» در bot_settings --
+    فایل نسخه‌ی تست (trial_file) و فایل نسخه‌ی پولی (paid_file). هر دو
+    منطق کاملاً یکسانی دارند (یک کلید ثابت، همیشه جایگزین می‌شود، نه
+    لیستی از چند مورد -- برخلاف کتابخانه‌ی فایل‌های آماده).
+    خروجی: True اگر پردازش شد، False در غیر این صورت.
+    """
+    admin_user_id = update.effective_user.id
+    if admin_user_id != ADMIN_ID:
+        return False
+    state, _ = get_state(ADMIN_ID)
+    state_map = {
+        "adm_awaiting_trial_file_content": ("trial_file", "نسخه‌ی تست", admin_panel_menu()),
+        "adm_awaiting_paid_file_content": ("paid_file", "نسخه‌ی پولی", admin_library_menu()),
+    }
+    if state not in state_map:
+        return False
+    setting_key, label, back_menu = state_map[state]
+
+    msg = update.message
+    file_type, file_id = detect_message_content(msg)
+    if file_type is None:
+        await update.message.reply_text("❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.")
+        return True
+
+    import json
+    caption = msg.caption if file_type != "text" else msg.text
+    set_bot_setting(setting_key, json.dumps({"file_type": file_type, "file_id": file_id, "caption": caption}))
+    clear_state(ADMIN_ID)
+    await update.message.reply_text(f"✅ فایل {label} ذخیره شد.", reply_markup=back_menu)
+    return True
+
+async def handle_admin_library_file_upload(update, context):
+    """
+    آپلود یک فایل جدید در کتابخانه‌ی فایل‌های آماده‌ی ادمین (حداکثر ۱۰
+    عدد). مرحله‌ی دوم از یک فرایند دومرحله‌ای: مرحله‌ی اول (گرفتن اسم)
+    در handle_admin_panel_message مدیریت می‌شود؛ این تابع فقط مرحله‌ی
+    دوم (گرفتن خود محتوا) را انجام می‌دهد. خروجی: True اگر پردازش شد.
+    """
+    admin_user_id = update.effective_user.id
+    if admin_user_id != ADMIN_ID:
+        return False
+    state, label = get_state(ADMIN_ID)
+    if state != "adm_awaiting_new_file_content":
+        return False
+
+    if count_admin_files() >= 10:
+        await update.message.reply_text(
+            "⛔ در حال حاضر ۱۰ فایل ثبت شده (حداکثر مجاز). اول یکی را از لیست حذف کنید.",
+            reply_markup=admin_library_menu()
+        )
+        clear_state(ADMIN_ID)
+        return True
+
+    msg = update.message
+    file_type, file_id = detect_message_content(msg)
+    if file_type is None:
+        await update.message.reply_text("❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.")
+        return True
+
+    caption = msg.caption if file_type != "text" else msg.text
+    add_admin_file(label, file_type, file_id, caption)
+    clear_state(ADMIN_ID)
+    await update.message.reply_text(f"✅ فایل «{label}» به کتابخانه اضافه شد.", reply_markup=admin_library_menu())
+    return True
+
+async def handle_license_chat_content(update, context):
+    """
+    رله‌ی دوطرفه‌ی محتوا (متن/عکس/فایل/صدا/ویدیو، حتی فوروارد از یک
+    کانال دیگر) بین ادمین و کاربری که برای لایسنس پولی تأیید شده.
+    هم سمت ادمین (state=admin_chat_active) و هم سمت کاربر عادی
+    (state=user_chat_active) از همین یک تابع عبور می‌کنند. خروجی:
+    True اگر پردازش شد، False اگر این ماژول منتظر محتوا نبود.
+    """
+    sender_id = update.effective_user.id
+    state, data = get_state(sender_id)
+    msg = update.message
+
+    if state == "admin_chat_active" and sender_id == ADMIN_ID:
+        try:
+            chat_id_str, target_user_id_str = data.split(":")
+            chat_id = int(chat_id_str)
+            target_user_id = int(target_user_id_str)
+        except Exception:
+            await update.message.reply_text("❌ خطای داخلی؛ لطفاً دوباره از پیام درخواست شروع کنید.")
+            clear_state(ADMIN_ID)
+            return True
+
+        action_menu = license_chat_action_menu(chat_id)
+        sent = await relay_free_message(msg, context, target_user_id)
+        if sent:
+            await update.message.reply_text("✅ برای کاربر ارسال شد.", reply_markup=action_menu)
+        else:
+            await update.message.reply_text(
+                "❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.",
+                reply_markup=action_menu
+            )
+        return True
+
+    if state == "user_chat_active":
+        sent = await relay_free_message(msg, context, ADMIN_ID, prefix=f"💬 پیام از کاربر (آیدی {sender_id}):\n")
+        if not sent:
+            await update.message.reply_text("❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.")
+        return True
+
+    return False
+
 async def handle_admin_generic_content(update, context):
     """
-    دیسپچر ترکیبی برای همه‌ی فیچرهایی که ادمین می‌تواند در آن‌ها محتوای
-    آزاد (متن/عکس/فایل/صدا/ویدیو) برای یک کاربر خاص بفرستد -- ربات
-    مدیریت سرمایه و پاسخ به پیام کاربر. هر تابع خودش بر اساس state
-    فعلی ادمین تشخیص می‌دهد که آیا باید پردازش کند یا نه.
+    دیسپچر ترکیبی برای همه‌ی فیچرهایی که نیاز به رد و بدل کردن محتوای
+    آزاد (متن/عکس/فایل/صدا/ویدیو) بین ادمین و یک کاربر خاص دارند --
+    ربات مدیریت سرمایه، پاسخ به پیام کاربر، تنظیم فایل نسخه‌ی تست/پولی،
+    کتابخانه‌ی فایل‌های آماده، و چت زنده‌ی لایسنس. هر تابع خودش بر اساس
+    state فعلی فرستنده تشخیص می‌دهد که آیا باید پردازش کند یا نه.
     """
     if await handle_admin_capital_content(update, context):
         return True
     if await handle_admin_reply_content(update, context):
+        return True
+    if await handle_admin_keyed_file_upload(update, context):
+        return True
+    if await handle_admin_library_file_upload(update, context):
+        return True
+    if await handle_license_chat_content(update, context):
         return True
     return False
 
