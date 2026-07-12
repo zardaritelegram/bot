@@ -604,8 +604,11 @@ def save_trial_request(user_id):
 def create_license_chat(user_id):
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("INSERT INTO license_chats (user_id, status, created_at) VALUES (?, 'pending', ?)",
-              (user_id, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    # admin_id از همون اول روی مالک اصلی تنظیم می‌شود -- یعنی ابتدا همیشه
+    # اول به دست ادمین اصلی می‌رسد؛ اگر دستی منتقل شود یا ۱۵ دقیقه بی‌پاسخ
+    # بماند (escalation خودکار)، این مقدار عوض می‌شود.
+    c.execute("INSERT INTO license_chats (user_id, status, admin_id, created_at) VALUES (?, 'pending', ?, ?)",
+              (user_id, ADMIN_ID, get_iran_now().strftime("%Y-%m-%d %H:%M")))
     chat_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -634,6 +637,38 @@ def assign_license_chat_admin(chat_id, admin_id):
     conn.commit()
     conn.close()
 
+def get_overdue_pending_license_chats(minutes=15):
+    """
+    درخواست‌های لایسنسی که هنوز 'pending' هستند (کسی شروعش نکرده)، هنوز
+    دست ادمین اصلی مانده (منتقل نشده)، و بیش از {minutes} دقیقه از
+    ساختشان گذشته -- برای واگذاری خودکار توسط license_escalation_loop.
+    """
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    cutoff = (get_iran_now() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M")
+    c.execute("SELECT id, user_id FROM license_chats WHERE status='pending' AND admin_id=? AND created_at<=?",
+              (ADMIN_ID, cutoff))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_next_round_robin_admin():
+    """
+    آیدی ادمین بعدی برای واگذاری خودکار -- به‌ترتیب و مساوی بین
+    ادمین‌های اضافه‌شده (نه مالک اصلی) می‌چرخد. اگر هیچ ادمین اضافه‌ای
+    وجود نداشته باشد، None برمی‌گرداند (یعنی جایی برای واگذاری نیست).
+    """
+    extra_admins = get_all_extra_admins()
+    if not extra_admins:
+        return None
+    extra_ids = [a[0] for a in extra_admins]
+    idx_str = get_bot_setting("license_round_robin_index")
+    idx = int(idx_str) if idx_str and idx_str.isdigit() else 0
+    idx = idx % len(extra_ids)
+    next_admin_id = extra_ids[idx]
+    set_bot_setting("license_round_robin_index", str((idx + 1) % len(extra_ids)))
+    return next_admin_id
+
 # ─── کتابخانه‌ی فایل‌های آماده‌ی ادمین (حداکثر ۱۰ عدد) ────────────
 def add_admin_file(label, file_type, file_id, caption):
     conn = sqlite3.connect("bot.db")
@@ -660,6 +695,15 @@ def get_admin_file(file_db_id):
     row = c.fetchone()
     conn.close()
     return row
+
+def update_admin_file(file_db_id, label, file_type, file_id, caption):
+    """جایگزینی کامل اسم و محتوای یک فایل کتابخانه، بدون نیاز به حذف و افزودن دوباره"""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("UPDATE admin_files SET label=?, file_type=?, file_id=?, caption=? WHERE id=?",
+              (label, file_type, file_id, caption, file_db_id))
+    conn.commit()
+    conn.close()
 
 def delete_admin_file(file_db_id):
     conn = sqlite3.connect("bot.db")
@@ -941,17 +985,14 @@ async def handle_financial(query, user_id, context):
     elif data == "cap_paid_confirm":
         requester = query.from_user
         chat_id = create_license_chat(user_id)
-        await notify_admins(
-            context.bot,
-            f"💳 درخواست نسخه‌ی پولی (لایسنس) ربات مدیریت سرمایه\n\n"
-            f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
-            f"🆔 آیدی: {user_id}\n\n"
-            f"برای شروع مکالمه‌ی دوطرفه (متن/عکس/فایل/صدا/ویدیو، شامل فوروارد از "
-            f"کانال‌های دیگر) با این کاربر، دکمه‌ی زیر را بزنید.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ شروع مکالمه", callback_data=f"lic_start_{chat_id}")]
-            ])
-        )
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                license_request_text(requester.first_name, requester.username, user_id),
+                reply_markup=license_request_primary_menu(chat_id)
+            )
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی درخواست لایسنس به مالک اصلی: {e}")
         await query.edit_message_text(
             "✅ درخواست شما برای ادمین ارسال شد؛ به‌زودی مکالمه شروع می‌شود.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")]])
@@ -3731,6 +3772,28 @@ def license_chat_action_menu(chat_id):
         [InlineKeyboardButton("🔚 پایان مکالمه", callback_data=f"lic_end_{chat_id}")],
     ])
 
+def license_request_primary_menu(chat_id):
+    """پیامی که فقط مالک اصلی می‌بیند -- هم می‌تواند خودش شروع کند، هم منتقل کند"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ شروع مکالمه", callback_data=f"lic_start_{chat_id}")],
+        [InlineKeyboardButton("↪️ انتقال به ادمین دیگر", callback_data=f"lic_transfer_pick_{chat_id}")],
+    ])
+
+def license_request_assigned_menu(chat_id):
+    """پیامی که به ادمینی که چت به او منتقل/واگذار شده می‌رسد -- فقط شروع، بدون انتقال بیشتر"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ شروع مکالمه", callback_data=f"lic_start_{chat_id}")],
+    ])
+
+def license_request_text(requester_first_name, requester_username, user_id):
+    return (
+        f"💳 درخواست نسخه‌ی پولی (لایسنس) ربات مدیریت سرمایه\n\n"
+        f"👤 از طرف: {requester_first_name} (@{requester_username or 'ندارد'})\n"
+        f"🆔 آیدی: {user_id}\n\n"
+        f"برای شروع مکالمه‌ی دوطرفه (متن/عکس/فایل/صدا/ویدیو، شامل فوروارد از "
+        f"کانال‌های دیگر) با این کاربر، دکمه‌ی زیر را بزنید."
+    )
+
 async def handle_admin_panel(query, user_id, context):
     if not is_admin(user_id):
         await query.answer("⛔ این بخش فقط برای ادمین است.", show_alert=True)
@@ -4051,7 +4114,8 @@ async def handle_admin_panel(query, user_id, context):
             f"📄 {label}\nنوع: {file_type}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👁 پیش‌نمایش (ارسال برای خودم)", callback_data=f"adm_file_preview_{file_db_id}")],
-                [InlineKeyboardButton("🗑 حذف", callback_data=f"adm_file_del_{file_db_id}")],
+                [InlineKeyboardButton("✏️ ویرایش", callback_data=f"adm_file_edit_{file_db_id}"),  # ← حذف ویرایش کتابخانه = پاک کن این خط
+                 InlineKeyboardButton("🗑 حذف", callback_data=f"adm_file_del_{file_db_id}")],
                 [InlineKeyboardButton("🔙 برگشت", callback_data="adm_files_list")],
             ])
         )
@@ -4065,6 +4129,19 @@ async def handle_admin_panel(query, user_id, context):
         label, file_type, file_id, caption = row
         await send_content_by_type(context, user_id, file_type, file_id, caption, default_caption=label)
         await query.answer("✅ برای شما ارسال شد.")
+
+    elif data.startswith("adm_file_edit_"):  # ← حذف ویرایش کتابخانه = پاک کن این بلوک
+        file_db_id = int(data.replace("adm_file_edit_", ""))
+        row = get_admin_file(file_db_id)
+        if not row:
+            await query.answer("این فایل پیدا نشد.", show_alert=True)
+            return
+        label, file_type, file_id, caption = row
+        set_state(user_id, "adm_awaiting_edit_file_label", str(file_db_id))
+        await query.edit_message_text(
+            f"✏️ ویرایش «{label}»\n\nاسم جدید را بنویسید (یا همان اسم قبلی را دوباره بفرستید اگر نمی‌خواهید عوض شود):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data=f"adm_file_view_{file_db_id}")]])
+        )
 
     elif data.startswith("adm_file_del_"):
         file_db_id = int(data.replace("adm_file_del_", ""))
@@ -4306,6 +4383,13 @@ async def handle_admin_panel_message(user_id, text, update):
         label = text.strip()[:60]
         set_state(user_id, "adm_awaiting_new_file_content", label)
         await update.message.reply_text(f"حالا متن، عکس، فایل، صدا یا ویدیوی «{label}» را بفرستید:")
+        return True
+
+    elif state == "adm_awaiting_edit_file_label":  # ← حذف ویرایش کتابخانه = پاک کن این بلوک
+        file_db_id = int(data)
+        new_label = text.strip()[:60]
+        set_state(user_id, "adm_awaiting_edit_file_content", f"{file_db_id}:{new_label}")
+        await update.message.reply_text(f"حالا محتوای جدید «{new_label}» را بفرستید (متن، عکس، فایل، صدا یا ویدیو):")
         return True
 
     elif state == "adm_awaiting_new_text_label":
@@ -8172,6 +8256,65 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=license_chat_action_menu(chat_id)
         )
 
+    elif data.startswith("lic_transfer_pick_"):  # ← حذف انتقال چت لایسنس = پاک کن این ۲ بلوک elif
+        if not is_primary_admin(user_id):
+            await query.answer("⛔ فقط مالک اصلی می‌تواند مکالمه را منتقل کند.", show_alert=True)
+            return
+        chat_id = int(data.replace("lic_transfer_pick_", ""))
+        chat_row = get_license_chat(chat_id)
+        if not chat_row or chat_row[1] == "closed":
+            await query.answer("این مکالمه دیگر معتبر نیست.", show_alert=True)
+            return
+        extra_admins = get_all_extra_admins()
+        if not extra_admins:
+            await query.answer("هنوز هیچ ادمین اضافه‌ای تعریف نکرده‌اید (پنل مدیریت → مدیریت ادمین‌ها).", show_alert=True)
+            return
+        rows = [[InlineKeyboardButton(f"👤 {aid}", callback_data=f"lic_transfer_to_{chat_id}_{aid}")]
+                for aid, _added_at in extra_admins]
+        rows.append([InlineKeyboardButton("🔙 انصراف", callback_data=f"lic_cancel_transfer_{chat_id}")])
+        await query.edit_message_text("↪️ این مکالمه به کدام ادمین منتقل شود؟", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data.startswith("lic_transfer_to_"):
+        if not is_primary_admin(user_id):
+            await query.answer("⛔ فقط مالک اصلی می‌تواند مکالمه را منتقل کند.", show_alert=True)
+            return
+        remainder = data.replace("lic_transfer_to_", "")
+        chat_id_str, target_admin_id_str = remainder.split("_")
+        chat_id, target_admin_id = int(chat_id_str), int(target_admin_id_str)
+        chat_row = get_license_chat(chat_id)
+        if not chat_row or chat_row[1] == "closed":
+            await query.answer("این مکالمه دیگر معتبر نیست.", show_alert=True)
+            return
+        target_user_id = chat_row[0]
+        requester_target = await context.bot.get_chat(target_user_id)
+        assign_license_chat_admin(chat_id, target_admin_id)
+        try:
+            await context.bot.send_message(
+                target_admin_id,
+                license_request_text(requester_target.first_name or "کاربر", requester_target.username, target_user_id),
+                reply_markup=license_request_assigned_menu(chat_id)
+            )
+        except Exception as e:
+            print(f"خطای ارسال درخواست منتقل‌شده به ادمین {target_admin_id}: {e}")
+        await query.edit_message_text(f"✅ مکالمه به ادمین {target_admin_id} منتقل شد.")
+
+    elif data.startswith("lic_cancel_transfer_"):
+        chat_id = int(data.replace("lic_cancel_transfer_", ""))
+        chat_row = get_license_chat(chat_id)
+        if not chat_row:
+            await query.answer("این مکالمه پیدا نشد.", show_alert=True)
+            return
+        target_user_id, status, _admin_id = chat_row
+        try:
+            requester_target = await context.bot.get_chat(target_user_id)
+            req_name, req_username = requester_target.first_name or "کاربر", requester_target.username
+        except Exception:
+            req_name, req_username = "کاربر", None
+        await query.edit_message_text(
+            license_request_text(req_name, req_username, target_user_id),
+            reply_markup=license_request_primary_menu(chat_id)
+        )
+
     elif data.startswith("lic_end_"):  # ← حذف فیچر چت لایسنس = پاک کن این بلوک
         if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
@@ -8346,7 +8489,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state, _ = get_state(user_id)
 
     if state in ("admin_awaiting_capital_content", "admin_awaiting_reply_content", "adm_awaiting_trial_file_content",
-                  "adm_awaiting_paid_file_content", "adm_awaiting_new_file_content",
+                  "adm_awaiting_paid_file_content", "adm_awaiting_new_file_content", "adm_awaiting_edit_file_content",
                   "admin_chat_active", "user_chat_active"):  # ← حذف ماژول ربات مدیریت سرمایه/پیام به ادمین/چت لایسنس/کتابخانه = پاک کن این خط
         handled = await handle_admin_generic_content(update, context)
         if handled:
@@ -8410,7 +8553,49 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app):
     asyncio.create_task(alarm_loop(app))
     asyncio.create_task(reminder_loop(app))  # ← حذف ماژول یادآور = پاک کن این خط
+    asyncio.create_task(license_escalation_loop(app))  # ← حذف انتقال خودکار چت لایسنس = پاک کن این خط
     print("⏰ سیستم آلارم فعال شد")
+
+async def license_escalation_loop(app):
+    """
+    هر ۶۰ ثانیه چک می‌کند که آیا درخواست لایسنسی وجود دارد که هنوز
+    'pending' مانده، دست مالک اصلی است (منتقل نشده)، و بیش از ۱۵ دقیقه
+    از ساختش گذشته. اگر بله و حداقل یک ادمین اضافه وجود داشته باشد،
+    به‌صورت round-robin (به‌ترتیب و مساوی) به یکی از آن‌ها واگذار می‌شود.
+    """
+    while True:
+        try:
+            overdue = get_overdue_pending_license_chats(minutes=15)
+            for chat_id, target_user_id in overdue:
+                next_admin_id = get_next_round_robin_admin()
+                if next_admin_id is None:
+                    continue  # هیچ ادمین اضافه‌ای نیست -- کاری نمی‌شود کرد، دست مالک اصلی می‌ماند
+                assign_license_chat_admin(chat_id, next_admin_id)
+                try:
+                    requester_target = await app.bot.get_chat(target_user_id)
+                    req_name, req_username = requester_target.first_name or "کاربر", requester_target.username
+                except Exception:
+                    req_name, req_username = "کاربر", None
+                try:
+                    await app.bot.send_message(
+                        next_admin_id,
+                        f"⏰ این درخواست بیش از ۱۵ دقیقه بی‌پاسخ مانده و خودکار به شما واگذار شد:\n\n"
+                        + license_request_text(req_name, req_username, target_user_id),
+                        reply_markup=license_request_assigned_menu(chat_id)
+                    )
+                except Exception as e:
+                    print(f"خطای اطلاع‌رسانی واگذاری خودکار به ادمین {next_admin_id}: {e}")
+                try:
+                    await app.bot.send_message(
+                        ADMIN_ID,
+                        f"ℹ️ درخواست لایسنس کاربر {target_user_id} بعد از ۱۵ دقیقه بی‌پاسخی، "
+                        f"خودکار به ادمین {next_admin_id} واگذار شد."
+                    )
+                except Exception as e:
+                    print(f"خطای اطلاع کوتاه واگذاری خودکار به مالک اصلی: {e}")
+        except Exception as e:
+            print(f"خطای license_escalation_loop: {e}")
+        await asyncio.sleep(60)
 
 # ─── Web server ساده برای Railway (بدون این Railway بات رو خاموش می‌کنه) ───
 class HealthHandler(BaseHTTPRequestHandler):
@@ -8605,6 +8790,40 @@ async def handle_admin_library_file_upload(update, context):
     await update.message.reply_text(f"✅ فایل «{label}» به کتابخانه اضافه شد.", reply_markup=admin_library_menu())
     return True
 
+async def handle_admin_library_file_edit(update, context):
+    """
+    مرحله‌ی دوم ویرایش یک فایل موجود در کتابخانه (جایگزینی کامل بدون
+    حذف و افزودن دوباره). مرحله‌ی اول (گرفتن اسم جدید) در
+    handle_admin_panel_message مدیریت می‌شود؛ این تابع فقط مرحله‌ی دوم
+    (گرفتن محتوای جدید) را انجام می‌دهد. خروجی: True اگر پردازش شد.
+    """
+    admin_user_id = update.effective_user.id
+    if not is_admin(admin_user_id):
+        return False
+    state, data = get_state(admin_user_id)
+    if state != "adm_awaiting_edit_file_content":
+        return False
+
+    try:
+        file_db_id_str, new_label = data.split(":", 1)
+        file_db_id = int(file_db_id_str)
+    except Exception:
+        await update.message.reply_text("❌ خطای داخلی؛ لطفاً دوباره از لیست فایل‌ها شروع کنید.", reply_markup=admin_library_menu())
+        clear_state(admin_user_id)
+        return True
+
+    msg = update.message
+    file_type, file_id = detect_message_content(msg)
+    if file_type is None:
+        await update.message.reply_text("❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.")
+        return True
+
+    caption = msg.caption if file_type != "text" else msg.text
+    update_admin_file(file_db_id, new_label, file_type, file_id, caption)
+    clear_state(admin_user_id)
+    await update.message.reply_text(f"✅ فایل «{new_label}» به‌روزرسانی شد.", reply_markup=admin_library_menu())
+    return True
+
 async def handle_admin_broadcast_content_media(update, context):
     """
     دریافت محتوای غیرمتنی (عکس/فایل/صدا/ویدیو -- حتی فوروارد از یک
@@ -8715,6 +8934,8 @@ async def handle_admin_generic_content(update, context):
     if await handle_admin_keyed_file_upload(update, context):
         return True
     if await handle_admin_library_file_upload(update, context):
+        return True
+    if await handle_admin_library_file_edit(update, context):
         return True
     if await handle_admin_broadcast_content_media(update, context):
         return True
