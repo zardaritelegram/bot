@@ -16,7 +16,6 @@ import re
 import time as time_module
 import csv
 import multiprocessing
-import json
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -25,7 +24,6 @@ TOKEN = os.environ.get("TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 GOLD_API_KEY = "goldapi-d23da414dfdcbbe06a2e2ce8d28a095c-io"
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-SIGNAL_SECRET = os.environ.get("SIGNAL_SECRET", "")  # رمز مشترک بین EA و ربات برای فیچر سیگنال معاملاتی
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -76,20 +74,6 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS admin_texts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         label TEXT, content TEXT, created_at TEXT)''')  # ← حذف کتابخانه متن ادمین = پاک کن این خط
-    c.execute('''CREATE TABLE IF NOT EXISTS signal_accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        account_number TEXT UNIQUE, label TEXT, created_at TEXT)''')  # ← حذف ماژول سیگنال معاملاتی = این ۴ جدول را پاک کن
-    c.execute('''CREATE TABLE IF NOT EXISTS signal_subscribers (
-        user_id INTEGER PRIMARY KEY, subscribed_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ticket INTEGER, account_number TEXT, symbol TEXT, direction TEXT,
-        entry_price REAL, sl REAL, tp REAL, lot REAL,
-        open_time TEXT, close_time TEXT, close_price REAL, profit REAL,
-        status TEXT DEFAULT 'open', created_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS signal_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        signal_id INTEGER, user_id INTEGER, message_id INTEGER, created_at TEXT)''')
     for col_def in [
         "ALTER TABLE users ADD COLUMN daily_msg INTEGER DEFAULT 1",
         "ALTER TABLE users ADD COLUMN referral_code TEXT",
@@ -768,8 +752,7 @@ def financial_menu():
         [InlineKeyboardButton("📶 اندیکاتور شخصی", callback_data="ind_custom"),  # ← حذف ماژول اندیکاتور شخصی = پاک کن این خط
          InlineKeyboardButton("🧠 تحلیل هوش مصنوعی", callback_data="menu_ai_market")],  # ← حذف ماژول تحلیل بازار = پاک کن این خط
         [InlineKeyboardButton("📰 اخبار مهم امروز/هفته", callback_data="fin_news")],  # ← حذف ماژول اخبار = پاک کن این خط
-        [InlineKeyboardButton("🤖 ربات مدیریت سرمایه", callback_data="fin_capital_bot"),  # ← حذف ماژول ربات مدیریت سرمایه = پاک کن این خط
-         InlineKeyboardButton("📡 سیگنال معاملاتی", callback_data="menu_signal")],  # ← حذف ماژول سیگنال معاملاتی = پاک کن این خط
+        [InlineKeyboardButton("🤖 ربات مدیریت سرمایه", callback_data="fin_capital_bot")],  # ← حذف ماژول ربات مدیریت سرمایه = پاک کن این خط
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
 
@@ -1079,412 +1062,6 @@ async def handle_financial_message(user_id, text, update):
     return False
 
 # ═══════════════ پایان MODULE: FINANCIAL ═══════════════════════
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║              MODULE: SIGNAL BROADCAST (سیگنال معاملاتی)      ║
-# ║  دریافت رویدادهای معاملاتی از EA متاتریدر ۵ (از طریق endpoint  ║
-# ║  HTTP در همین سرویس Railway، بدون webhook تلگرام -- تا با      ║
-# ║  polling ربات تداخل نداشته باشد) و رله‌ی زنجیره‌ای (ریپلای)      ║
-# ║  به مشترکین: باز شدن → پیام جدید، مدیریت/بستن → ریپلای به      ║
-# ║  همان پیام. برای حذف: این بلوک را پاک کن + دکمه‌ی menu_signal    ║
-# ║  را از financial_menu پاک کن + خط sig_/menu_signal را از        ║
-# ║  ROUTER پاک کن + بخش‌های adm_signal_/adm_export_signals را از   ║
-# ║ admin_panel_menu و handle_admin_panel پاک کن + do_POST را از    ║
-# ║  HealthHandler پاک کن                                          ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-def add_signal_account(account_number, label):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO signal_accounts (account_number, label, created_at) VALUES (?, ?, ?)",
-              (account_number, label, get_iran_now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit()
-    conn.close()
-
-def get_signal_accounts():
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT id, account_number, label FROM signal_accounts ORDER BY id")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_signal_account(account_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT account_number, label FROM signal_accounts WHERE id=?", (account_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-def delete_signal_account(account_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM signal_accounts WHERE id=?", (account_id,))
-    conn.commit()
-    conn.close()
-
-def is_account_allowed(account_number):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM signal_accounts WHERE account_number=?", (str(account_number),))
-    row = c.fetchone()
-    conn.close()
-    return row is not None
-
-def add_signal_subscriber(user_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO signal_subscribers (user_id, subscribed_at) VALUES (?, ?) "
-              "ON CONFLICT(user_id) DO UPDATE SET subscribed_at=excluded.subscribed_at",
-              (user_id, get_iran_now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit()
-    conn.close()
-
-def remove_signal_subscriber(user_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM signal_subscribers WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def is_signal_subscriber(user_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM signal_subscribers WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row is not None
-
-def get_signal_subscribers():
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM signal_subscribers")
-    rows = [r[0] for r in c.fetchall()]
-    conn.close()
-    return rows
-
-def create_signal(ticket, account_number, symbol, direction, entry, sl, tp, lot):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    now = get_iran_now().strftime("%Y-%m-%d %H:%M")
-    c.execute('''INSERT INTO signals (ticket, account_number, symbol, direction, entry_price, sl, tp, lot,
-                 open_time, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)''',
-              (ticket, account_number, symbol, direction, entry, sl, tp, lot, now, now))
-    signal_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return signal_id
-
-def get_open_signal_by_ticket(ticket, account_number):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT id FROM signals WHERE ticket=? AND account_number=? AND status='open'", (ticket, account_number))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-def close_signal(signal_id, close_price, profit, status="closed"):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("UPDATE signals SET close_price=?, profit=?, status=?, close_time=? WHERE id=?",
-              (close_price, profit, status, get_iran_now().strftime("%Y-%m-%d %H:%M"), signal_id))
-    conn.commit()
-    conn.close()
-
-def save_signal_message(signal_id, user_id, message_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO signal_messages (signal_id, user_id, message_id, created_at) VALUES (?, ?, ?, ?)",
-              (signal_id, user_id, message_id, get_iran_now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit()
-    conn.close()
-
-def get_signal_messages(signal_id):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id, message_id FROM signal_messages WHERE signal_id=?", (signal_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_open_signals():
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT symbol, direction, entry_price, sl, tp, lot, open_time FROM signals WHERE status='open' ORDER BY id DESC")
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def get_signals_since(days=None, start_date=None, end_date=None):
-    """
-    دریافت ردیف‌های جدول signals با فیلتر زمانی اختیاری روی open_time:
-      - days=N: فقط N روز اخیر (برای خروجی اکسل کاربر)
-      - start_date/end_date: بازه‌ی دلخواه به فرمت "YYYY-MM-DD" (برای استیتمنت ادمین)
-    اگر هیچ فیلتری داده نشود، همه‌ی ردیف‌ها برمی‌گردند.
-    """
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    query = '''SELECT ticket, account_number, symbol, direction, entry_price, sl, tp, lot,
-                      open_time, close_time, close_price, profit, status
-               FROM signals WHERE 1=1'''
-    params = []
-    if days is not None:
-        cutoff = (get_iran_now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
-        query += " AND open_time >= ?"
-        params.append(cutoff)
-    if start_date:
-        query += " AND open_time >= ?"
-        params.append(f"{start_date} 00:00")
-    if end_date:
-        query += " AND open_time <= ?"
-        params.append(f"{end_date} 23:59")
-    query += " ORDER BY id DESC"
-    c.execute(query, params)
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def generate_signals_excel(rows):
-    """ساخت فایل اکسل از یک لیست ردیف‌های از‌قبل‌گرفته‌شده‌ی جدول signals (برای ادمین کامل، برای کاربر فیلترشده)"""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "ژورنال سیگنال‌ها"
-    headers = ["تیکت", "شماره حساب", "نماد", "جهت", "قیمت ورود", "حد ضرر", "حد سود", "حجم",
-               "زمان باز شدن", "زمان بسته شدن", "قیمت بسته شدن", "سود/زیان", "وضعیت"]
-    ws.append(headers)
-    for col in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center")
-    for row in rows:
-        ws.append(list(row))
-    for col_cells in ws.columns:
-        length = max((len(str(cell.value)) if cell.value else 0) for cell in col_cells)
-        ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 10), 30)
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return buffer
-
-def generate_signals_statement_html(rows, start_date, end_date):
-    """
-    ساخت یک استیتمنت HTML حرفه‌ای (قابل باز شدن با هر مرورگر، از جمله
-    روی گوشی) از ردیف‌های جدول signals در یک بازه‌ی زمانی. جایگزین
-    عملی برای «استیتمنت رسمی بروکر» -- منبع داده، ژورنال خودِ ربات
-    (از طریق EA) است، نه فایل رسمی بروکر.
-    """
-    closed = [r for r in rows if r[12] == "closed"]
-    total_trades = len(closed)
-    total_profit = sum((r[11] or 0) for r in closed)
-    wins = len([r for r in closed if (r[11] or 0) > 0])
-    losses = len([r for r in closed if (r[11] or 0) < 0])
-    win_rate = (wins / total_trades * 100) if total_trades else 0
-
-    rows_html = ""
-    for r in rows:
-        ticket, account, symbol, direction, entry, sl, tp, lot, open_time, close_time, close_price, profit, status = r
-        direction_fa = "خرید" if direction == "buy" else "فروش"
-        profit_str = f"{profit:+.2f}" if profit is not None else "—"
-        profit_color = "#16a34a" if (profit or 0) >= 0 else "#dc2626"
-        status_fa = {"open": "باز", "closed": "بسته"}.get(status, status)
-        rows_html += f"""<tr>
-            <td>{ticket}</td><td>{account}</td><td>{symbol}</td><td>{direction_fa}</td>
-            <td>{entry}</td><td>{sl}</td><td>{tp}</td><td>{lot}</td>
-            <td>{open_time or '—'}</td><td>{close_time or '—'}</td><td>{close_price or '—'}</td>
-            <td style="color:{profit_color}; font-weight:bold;">{profit_str}</td><td>{status_fa}</td>
-        </tr>"""
-
-    html = f"""<!DOCTYPE html>
-<html dir="rtl" lang="fa">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>استیتمنت معاملات</title>
-<style>
-  body {{ font-family: Tahoma, sans-serif; background:#f3f4f6; margin:0; padding:16px; }}
-  h1 {{ font-size:20px; color:#111827; }}
-  .meta {{ color:#6b7280; margin-bottom:16px; font-size:13px; }}
-  .summary {{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:20px; }}
-  .card {{ background:#fff; border-radius:10px; padding:12px 16px; box-shadow:0 1px 3px rgba(0,0,0,.1); flex:1; min-width:120px; }}
-  .card .label {{ font-size:12px; color:#6b7280; }}
-  .card .value {{ font-size:18px; font-weight:bold; color:#111827; }}
-  table {{ width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; font-size:12px; }}
-  th, td {{ padding:8px; text-align:center; border-bottom:1px solid #e5e7eb; white-space:nowrap; }}
-  th {{ background:#111827; color:#fff; position:sticky; top:0; }}
-  .table-wrap {{ overflow-x:auto; }}
-</style>
-</head>
-<body>
-  <h1>📊 استیتمنت معاملات</h1>
-  <div class="meta">بازه: {start_date} تا {end_date} | تولید‌شده: {get_iran_now().strftime("%Y-%m-%d %H:%M")} به وقت ایران</div>
-  <div class="summary">
-    <div class="card"><div class="label">تعداد معاملات بسته‌شده</div><div class="value">{total_trades}</div></div>
-    <div class="card"><div class="label">مجموع سود/زیان</div><div class="value" style="color:{'#16a34a' if total_profit>=0 else '#dc2626'}">{total_profit:+.2f}$</div></div>
-    <div class="card"><div class="label">تعداد برد</div><div class="value" style="color:#16a34a">{wins}</div></div>
-    <div class="card"><div class="label">تعداد باخت</div><div class="value" style="color:#dc2626">{losses}</div></div>
-    <div class="card"><div class="label">درصد برد</div><div class="value">{win_rate:.1f}%</div></div>
-  </div>
-  <div class="table-wrap">
-  <table>
-    <tr><th>تیکت</th><th>حساب</th><th>نماد</th><th>جهت</th><th>ورود</th><th>SL</th><th>TP</th><th>حجم</th>
-        <th>زمان باز شدن</th><th>زمان بسته شدن</th><th>قیمت خروج</th><th>سود/زیان</th><th>وضعیت</th></tr>
-    {rows_html}
-  </table>
-  </div>
-</body>
-</html>"""
-    return html
-
-def telegram_send_sync(chat_id, text, reply_to_message_id=None):
-    """
-    ارسال پیام تلگرام کاملاً sync (نه از طریق event loop اصلی ربات) --
-    چون این تابع فقط از ترد جدای وب‌سرور HTTP (هندلر do_POST) صدا زده
-    می‌شود که به event loop اصلی و شیء Application دسترسی امن ندارد.
-    مستقیماً Bot API خام تلگرام را با httpx صدا می‌زند.
-    خروجی: message_id در صورت موفقیت، None در خطا.
-    """
-    try:
-        params = {"chat_id": chat_id, "text": text}
-        if reply_to_message_id:
-            params["reply_to_message_id"] = reply_to_message_id
-        with httpx.Client(timeout=10) as client:
-            r = client.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=params)
-            resp = r.json()
-            if resp.get("ok"):
-                return resp["result"]["message_id"]
-            print(f"خطای ارسال سیگنال به {chat_id}: {resp}")
-            return None
-    except Exception as e:
-        print(f"خطای telegram_send_sync: {e}")
-        return None
-
-def process_signal_event(payload):
-    """
-    پردازش یک رویداد سیگنال دریافت‌شده از EA (بعد از تأیید رمز مشترک و
-    مجاز بودن شماره‌حساب در do_POST). این تابع کاملاً sync است و از
-    ترد وب‌سرور صدا زده می‌شود، نه از event loop اصلی ربات.
-    """
-    account = str(payload.get("account", "")).strip()
-    event = payload.get("event", "")
-    ticket = payload.get("ticket")
-    symbol = payload.get("symbol", "")
-    direction = payload.get("direction", "")
-    entry = payload.get("entry", 0)
-    sl = payload.get("sl", 0)
-    tp = payload.get("tp", 0)
-    lot = payload.get("lot", 0)
-    close_price = payload.get("close_price", 0)
-    profit = payload.get("profit", 0)
-    direction_fa = "خرید 📈" if direction == "buy" else "فروش 📉"
-
-    if event == "open":
-        signal_id = create_signal(ticket, account, symbol, direction, entry, sl, tp, lot)
-        text = (
-            f"📊 سیگنال جدید\n\n"
-            f"💱 نماد: {symbol}\n"
-            f"{direction_fa}\n"
-            f"💰 ورود: {entry}\n"
-            f"🛑 حد ضرر: {sl}\n"
-            f"🎯 حد سود: {tp}\n"
-            f"📦 حجم: {lot} لات"
-        )
-        for sub_user_id in get_signal_subscribers():
-            msg_id = telegram_send_sync(sub_user_id, text)
-            if msg_id:
-                save_signal_message(signal_id, sub_user_id, msg_id)
-        return
-
-    signal_row = get_open_signal_by_ticket(ticket, account)
-    if not signal_row:
-        print(f"سیگنال باز برای ticket={ticket} account={account} پیدا نشد (event={event})")
-        return
-    signal_id = signal_row[0]
-
-    if event == "modify":
-        text = f"🔄 مدیریت معامله ({symbol})\n\n🛑 حد ضرر جدید: {sl}\n🎯 حد سود جدید: {tp}"
-    elif event == "partial_close":
-        text = (f"📉 بستن جزئی ({symbol})\n\n💰 قیمت بستن این بخش: {close_price}\n"
-                f"📊 سود/زیان این بخش: {profit:+.2f}$\n📦 حجم باقی‌مانده: {lot} لات")
-    elif event == "close":
-        result_word = "✅ سود" if profit >= 0 else "❌ زیان"
-        text = f"🔚 معامله بسته شد ({symbol})\n\n💰 قیمت خروج: {close_price}\n{result_word}: {profit:+.2f}$"
-        close_signal(signal_id, close_price, profit, "closed")
-    else:
-        print(f"نوع رویداد سیگنال ناشناخته: {event}")
-        return
-
-    for target_user_id, message_id in get_signal_messages(signal_id):
-        telegram_send_sync(target_user_id, text, reply_to_message_id=message_id)
-
-def signal_menu(user_id):
-    subscribed = is_signal_subscriber(user_id)
-    toggle_label = "🔕 غیرفعال‌سازی سیگنال" if subscribed else "🔔 فعال‌سازی سیگنال"
-    toggle_cb = "sig_unsubscribe" if subscribed else "sig_subscribe"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(toggle_label, callback_data=toggle_cb),
-         InlineKeyboardButton("📊 سیگنال‌های باز الان", callback_data="sig_open_now")],
-        [InlineKeyboardButton("📥 خروجی اکسل (۱ ماه اخیر)", callback_data="sig_export_excel")],  # ← حذف این دکمه = پاک کن این خط
-        [InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")],
-    ])
-
-async def handle_signal(query, user_id, context):
-    data = query.data
-
-    if data == "menu_signal":
-        status_line = "✅ در حال حاضر مشترک سیگنال هستید." if is_signal_subscriber(user_id) else "شما هنوز مشترک سیگنال نیستید."
-        await query.edit_message_text(f"📡 سیگنال معاملاتی\n\n{status_line}", reply_markup=signal_menu(user_id))
-
-    elif data == "sig_subscribe":
-        add_signal_subscriber(user_id)
-        await query.edit_message_text(
-            "✅ سیگنال‌ها فعال شد؛ از این پس هر معامله‌ی جدید همین‌جا برایتان ارسال می‌شود.",
-            reply_markup=signal_menu(user_id)
-        )
-
-    elif data == "sig_unsubscribe":
-        remove_signal_subscriber(user_id)
-        await query.edit_message_text("🔕 سیگنال‌ها غیرفعال شد.", reply_markup=signal_menu(user_id))
-
-    elif data == "sig_export_excel":  # ← حذف این بلوک = پاک کن این elif
-        rows = get_signals_since(days=30)
-        if not rows:
-            await query.answer("در ۱ ماه اخیر سیگنالی ثبت نشده.", show_alert=True)
-            return
-        await query.answer("⏳ در حال ساخت فایل اکسل...")
-        buffer = generate_signals_excel(rows)
-        await context.bot.send_document(
-            user_id,
-            document=buffer,
-            filename=f"signals_last30days_{get_iran_now().strftime('%Y-%m-%d')}.xlsx",
-            caption="📊 سیگنال‌های ۱ ماه اخیر"
-        )
-
-    elif data == "sig_open_now":
-        open_signals = get_open_signals()
-        if not open_signals:
-            await query.edit_message_text("📭 در حال حاضر سیگنال باز فعالی وجود ندارد.", reply_markup=signal_menu(user_id))
-            return
-        lines = []
-        for symbol, direction, entry, sl, tp, lot, open_time in open_signals:
-            direction_fa = "خرید 📈" if direction == "buy" else "فروش 📉"
-            lines.append(f"💱 {symbol} | {direction_fa}\n💰 ورود: {entry} | 🛑 SL: {sl} | 🎯 TP: {tp} | 📦 {lot} لات")
-        text = "📊 سیگنال‌های باز فعلی:\n\n" + "\n\n".join(lines)
-        await query.edit_message_text(text[:4000], reply_markup=signal_menu(user_id))
-
-def admin_signal_accounts_menu():
-    accounts = get_signal_accounts()
-    rows = [[InlineKeyboardButton(f"🔢 {acc_num}" + (f" ({label})" if label else ""),
-                                    callback_data=f"adm_signal_view_{aid}")]
-            for aid, acc_num, label in accounts]
-    rows.append([InlineKeyboardButton("➕ افزودن شماره‌حساب", callback_data="adm_signal_add")])
-    rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(rows)
-
-# ═══════════════ پایان MODULE: SIGNAL BROADCAST ═════════════════
 
 
 
@@ -4019,9 +3596,6 @@ def admin_panel_menu():
         [InlineKeyboardButton("📢 ارسال پیام به کاربران", callback_data="adm_broadcast_menu")],
         [InlineKeyboardButton("📶 لیست اندیکاتورهای شخصی ارسالی", callback_data="adm_indicators")],
         [InlineKeyboardButton("📁 کتابخانه‌ی فایل و متن", callback_data="adm_library")],  # ← حذف کتابخانه = پاک کن این خط
-        [InlineKeyboardButton("📡 شماره‌حساب‌های سیگنال", callback_data="adm_signal_accounts"),  # ← حذف ماژول سیگنال = پاک کن این خط
-         InlineKeyboardButton("📥 اکسل ژورنال سیگنال‌ها", callback_data="adm_export_signals")],
-        [InlineKeyboardButton("📄 استیتمنت سیگنال (HTML)", callback_data="adm_signal_statement")],  # ← حذف = پاک کن این خط
         [InlineKeyboardButton("🔎 مدیریت سریع یک کاربر (با آیدی)", callback_data="adm_manage_user")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
@@ -4313,60 +3887,6 @@ async def handle_admin_panel(query, user_id, context):
         text = "📝 آخرین درخواست‌های ناموفق:\n\n" + "\n".join(lines)
         await query.edit_message_text(text[:4000], reply_markup=admin_panel_menu())
 
-    elif data == "adm_signal_accounts":  # ← حذف ماژول سیگنال = پاک کن این ۵ بلوک elif
-        await query.edit_message_text(
-            "📡 شماره‌حساب‌های مجاز به ارسال سیگنال:\n\n"
-            "(فقط EA هایی که با یکی از این شماره‌حساب‌ها به ربات وصل شوند، سیگنالشان پذیرفته می‌شود)",
-            reply_markup=admin_signal_accounts_menu()
-        )
-
-    elif data == "adm_signal_add":
-        set_state(user_id, "adm_awaiting_signal_account")
-        await query.edit_message_text(
-            "شماره‌حساب متاتریدر را وارد کنید. اختیاری: بعد از یک فاصله، یک اسم برای شناسایی بنویسید.\n\n"
-            "مثال: 12345678 حساب اصلی",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="adm_signal_accounts")]])
-        )
-
-    elif data.startswith("adm_signal_view_"):
-        account_id = int(data.replace("adm_signal_view_", ""))
-        row = get_signal_account(account_id)
-        if not row:
-            await query.answer("این شماره‌حساب پیدا نشد.", show_alert=True)
-            return
-        acc_num, label = row
-        await query.edit_message_text(
-            f"🔢 شماره‌حساب: {acc_num}\n🏷 برچسب: {label or 'بدون‌نام'}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑 حذف", callback_data=f"adm_signal_del_{account_id}")],
-                [InlineKeyboardButton("🔙 برگشت", callback_data="adm_signal_accounts")],
-            ])
-        )
-
-    elif data.startswith("adm_signal_del_"):
-        account_id = int(data.replace("adm_signal_del_", ""))
-        delete_signal_account(account_id)
-        await query.edit_message_text("✅ حذف شد.", reply_markup=admin_signal_accounts_menu())
-
-    elif data == "adm_export_signals":
-        await query.answer("⏳ در حال ساخت فایل اکسل...")
-        buffer = generate_signals_excel(get_signals_since())
-        await context.bot.send_document(
-            ADMIN_ID,
-            document=buffer,
-            filename=f"signals_{get_iran_now().strftime('%Y-%m-%d_%H-%M')}.xlsx",
-            caption="📊 خروجی اکسل کامل ژورنال سیگنال‌ها"
-        )
-        await query.message.reply_text("👆 فایل اکسل ارسال شد.", reply_markup=admin_panel_menu())
-
-    elif data == "adm_signal_statement":  # ← حذف = پاک کن این بلوک
-        set_state(user_id, "adm_awaiting_statement_start")
-        await query.edit_message_text(
-            "📄 استیتمنت سیگنال (HTML)\n\n"
-            "تاریخ شروع را به فرمت YYYY-MM-DD بنویسید (میلادی).\n\nمثال: 2026-06-01",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="admin_panel")]])
-        )
-
     elif data == "adm_library":  # ← حذف کتابخانه = پاک کن این بلوک
         await query.edit_message_text("📁 کتابخانه‌ی فایل و متن:", reply_markup=admin_library_menu())
 
@@ -4608,53 +4128,6 @@ async def handle_admin_panel_message(user_id, text, update):
         set_bot_setting("pricing_text", text.strip())
         clear_state(user_id)
         await update.message.reply_text("✅ متن قیمت‌گذاری ذخیره شد.", reply_markup=admin_library_menu())
-        return True
-
-    elif state == "adm_awaiting_signal_account":  # ← حذف ماژول سیگنال = پاک کن این بلوک
-        parts = text.strip().split(None, 1)
-        account_number = parts[0]
-        label = parts[1] if len(parts) > 1 else ""
-        try:
-            add_signal_account(account_number, label)
-            clear_state(user_id)
-            await update.message.reply_text(f"✅ شماره‌حساب «{account_number}» اضافه شد.", reply_markup=admin_signal_accounts_menu())
-        except sqlite3.IntegrityError:
-            await update.message.reply_text("❌ این شماره‌حساب قبلاً ثبت شده. یک شماره‌ی دیگر وارد کنید:")
-        return True
-
-    elif state == "adm_awaiting_statement_start":  # ← حذف = پاک کن این ۲ بلوک elif
-        start_date = text.strip()
-        try:
-            datetime.strptime(start_date, "%Y-%m-%d")
-        except ValueError:
-            await update.message.reply_text("❌ فرمت درست نیست. به شکل YYYY-MM-DD بنویسید، مثلاً 2026-06-01:")
-            return True
-        set_state(user_id, "adm_awaiting_statement_end", start_date)
-        await update.message.reply_text("✅ ثبت شد.\n\nحالا تاریخ پایان را وارد کنید (میلادی، مثال: 2026-06-30):")
-        return True
-
-    elif state == "adm_awaiting_statement_end":
-        end_date = text.strip()
-        try:
-            datetime.strptime(end_date, "%Y-%m-%d")
-        except ValueError:
-            await update.message.reply_text("❌ فرمت درست نیست. به شکل YYYY-MM-DD بنویسید، مثلاً 2026-06-30:")
-            return True
-        start_date = data
-        clear_state(user_id)
-        rows = get_signals_since(start_date=start_date, end_date=end_date)
-        if not rows:
-            await update.message.reply_text("📭 در این بازه هیچ سیگنالی ثبت نشده.", reply_markup=admin_panel_menu())
-            return True
-        html_content = generate_signals_statement_html(rows, start_date, end_date)
-        html_buffer = io.BytesIO(html_content.encode("utf-8"))
-        await context.bot.send_document(
-            ADMIN_ID,
-            document=html_buffer,
-            filename=f"statement_{start_date}_to_{end_date}.html",
-            caption=f"📄 استیتمنت سیگنال از {start_date} تا {end_date}\n\n(فایل را دانلود و با مرورگر گوشی باز کنید)"
-        )
-        await update.message.reply_text("👆 استیتمنت ارسال شد.", reply_markup=admin_panel_menu())
         return True
 
     elif state == "adm_awaiting_new_file_label":  # ← حذف کتابخانه = پاک کن این ۴ بلوک elif
@@ -8619,9 +8092,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_ai_market" or data.startswith("aim_"):
         await handle_market_ai(query, user_id, context)  # ← حذف ماژول تحلیل بازار = پاک کن این خط
 
-    elif data == "menu_signal" or data.startswith("sig_"):
-        await handle_signal(query, user_id, context)  # ← حذف ماژول سیگنال معاملاتی = پاک کن این خط
-
     elif data == "fin_news":
         await handle_forex_news(query, user_id)  # ← حذف ماژول اخبار = پاک کن این خط
 
@@ -8731,56 +8201,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is running!")
-
-    def do_POST(self):
-        """
-        دریافت رویدادهای سیگنال از EA متاتریدر ۵. این یک endpoint HTTP
-        معمولی است، NOT یک webhook تلگرام -- پس هیچ تداخلی با polling
-        اصلی ربات (app.run_polling در پایین فایل) ندارد. اجرا در ترد
-        جدای این وب‌سرور انجام می‌شود (نه در event loop اصلی)، به همین
-        دلیل ارسال پیام تلگرام از طریق telegram_send_sync (httpx خام)
-        انجام می‌شود، نه از طریق شیء Application.
-        """
-        if self.path != "/signal":
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(length) if length > 0 else b""
-
-        try:
-            payload = json.loads(body)
-        except Exception:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"invalid json")
-            return
-
-        if not SIGNAL_SECRET or payload.get("secret") != SIGNAL_SECRET:
-            self.send_response(403)
-            self.end_headers()
-            self.wfile.write(b"forbidden")
-            return
-
-        account = str(payload.get("account", "")).strip()
-        if not is_account_allowed(account):
-            self.send_response(403)
-            self.end_headers()
-            self.wfile.write(b"account not allowed")
-            return
-
-        try:
-            process_signal_event(payload)
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-        except Exception as e:
-            print(f"خطای پردازش رویداد سیگنال: {e}")
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(b"internal error")
-
     def log_message(self, *args):
         pass
 
