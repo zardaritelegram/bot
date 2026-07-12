@@ -1217,16 +1217,37 @@ def get_open_signals():
     conn.close()
     return rows
 
-def admin_generate_signals_excel():
-    """ساخت فایل اکسل کامل ژورنال سیگنال‌ها (همه‌ی وضعیت‌ها) برای دانلود ادمین"""
+def get_signals_since(days=None, start_date=None, end_date=None):
+    """
+    دریافت ردیف‌های جدول signals با فیلتر زمانی اختیاری روی open_time:
+      - days=N: فقط N روز اخیر (برای خروجی اکسل کاربر)
+      - start_date/end_date: بازه‌ی دلخواه به فرمت "YYYY-MM-DD" (برای استیتمنت ادمین)
+    اگر هیچ فیلتری داده نشود، همه‌ی ردیف‌ها برمی‌گردند.
+    """
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute('''SELECT ticket, account_number, symbol, direction, entry_price, sl, tp, lot,
-                        open_time, close_time, close_price, profit, status
-                 FROM signals ORDER BY id DESC''')
+    query = '''SELECT ticket, account_number, symbol, direction, entry_price, sl, tp, lot,
+                      open_time, close_time, close_price, profit, status
+               FROM signals WHERE 1=1'''
+    params = []
+    if days is not None:
+        cutoff = (get_iran_now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+        query += " AND open_time >= ?"
+        params.append(cutoff)
+    if start_date:
+        query += " AND open_time >= ?"
+        params.append(f"{start_date} 00:00")
+    if end_date:
+        query += " AND open_time <= ?"
+        params.append(f"{end_date} 23:59")
+    query += " ORDER BY id DESC"
+    c.execute(query, params)
     rows = c.fetchall()
     conn.close()
+    return rows
 
+def generate_signals_excel(rows):
+    """ساخت فایل اکسل از یک لیست ردیف‌های از‌قبل‌گرفته‌شده‌ی جدول signals (برای ادمین کامل، برای کاربر فیلترشده)"""
     wb = Workbook()
     ws = wb.active
     ws.title = "ژورنال سیگنال‌ها"
@@ -1248,6 +1269,75 @@ def admin_generate_signals_excel():
     wb.save(buffer)
     buffer.seek(0)
     return buffer
+
+def generate_signals_statement_html(rows, start_date, end_date):
+    """
+    ساخت یک استیتمنت HTML حرفه‌ای (قابل باز شدن با هر مرورگر، از جمله
+    روی گوشی) از ردیف‌های جدول signals در یک بازه‌ی زمانی. جایگزین
+    عملی برای «استیتمنت رسمی بروکر» -- منبع داده، ژورنال خودِ ربات
+    (از طریق EA) است، نه فایل رسمی بروکر.
+    """
+    closed = [r for r in rows if r[12] == "closed"]
+    total_trades = len(closed)
+    total_profit = sum((r[11] or 0) for r in closed)
+    wins = len([r for r in closed if (r[11] or 0) > 0])
+    losses = len([r for r in closed if (r[11] or 0) < 0])
+    win_rate = (wins / total_trades * 100) if total_trades else 0
+
+    rows_html = ""
+    for r in rows:
+        ticket, account, symbol, direction, entry, sl, tp, lot, open_time, close_time, close_price, profit, status = r
+        direction_fa = "خرید" if direction == "buy" else "فروش"
+        profit_str = f"{profit:+.2f}" if profit is not None else "—"
+        profit_color = "#16a34a" if (profit or 0) >= 0 else "#dc2626"
+        status_fa = {"open": "باز", "closed": "بسته"}.get(status, status)
+        rows_html += f"""<tr>
+            <td>{ticket}</td><td>{account}</td><td>{symbol}</td><td>{direction_fa}</td>
+            <td>{entry}</td><td>{sl}</td><td>{tp}</td><td>{lot}</td>
+            <td>{open_time or '—'}</td><td>{close_time or '—'}</td><td>{close_price or '—'}</td>
+            <td style="color:{profit_color}; font-weight:bold;">{profit_str}</td><td>{status_fa}</td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html dir="rtl" lang="fa">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>استیتمنت معاملات</title>
+<style>
+  body {{ font-family: Tahoma, sans-serif; background:#f3f4f6; margin:0; padding:16px; }}
+  h1 {{ font-size:20px; color:#111827; }}
+  .meta {{ color:#6b7280; margin-bottom:16px; font-size:13px; }}
+  .summary {{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:20px; }}
+  .card {{ background:#fff; border-radius:10px; padding:12px 16px; box-shadow:0 1px 3px rgba(0,0,0,.1); flex:1; min-width:120px; }}
+  .card .label {{ font-size:12px; color:#6b7280; }}
+  .card .value {{ font-size:18px; font-weight:bold; color:#111827; }}
+  table {{ width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; font-size:12px; }}
+  th, td {{ padding:8px; text-align:center; border-bottom:1px solid #e5e7eb; white-space:nowrap; }}
+  th {{ background:#111827; color:#fff; position:sticky; top:0; }}
+  .table-wrap {{ overflow-x:auto; }}
+</style>
+</head>
+<body>
+  <h1>📊 استیتمنت معاملات</h1>
+  <div class="meta">بازه: {start_date} تا {end_date} | تولید‌شده: {get_iran_now().strftime("%Y-%m-%d %H:%M")} به وقت ایران</div>
+  <div class="summary">
+    <div class="card"><div class="label">تعداد معاملات بسته‌شده</div><div class="value">{total_trades}</div></div>
+    <div class="card"><div class="label">مجموع سود/زیان</div><div class="value" style="color:{'#16a34a' if total_profit>=0 else '#dc2626'}">{total_profit:+.2f}$</div></div>
+    <div class="card"><div class="label">تعداد برد</div><div class="value" style="color:#16a34a">{wins}</div></div>
+    <div class="card"><div class="label">تعداد باخت</div><div class="value" style="color:#dc2626">{losses}</div></div>
+    <div class="card"><div class="label">درصد برد</div><div class="value">{win_rate:.1f}%</div></div>
+  </div>
+  <div class="table-wrap">
+  <table>
+    <tr><th>تیکت</th><th>حساب</th><th>نماد</th><th>جهت</th><th>ورود</th><th>SL</th><th>TP</th><th>حجم</th>
+        <th>زمان باز شدن</th><th>زمان بسته شدن</th><th>قیمت خروج</th><th>سود/زیان</th><th>وضعیت</th></tr>
+    {rows_html}
+  </table>
+  </div>
+</body>
+</html>"""
+    return html
 
 def telegram_send_sync(chat_id, text, reply_to_message_id=None):
     """
@@ -1337,6 +1427,7 @@ def signal_menu(user_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(toggle_label, callback_data=toggle_cb),
          InlineKeyboardButton("📊 سیگنال‌های باز الان", callback_data="sig_open_now")],
+        [InlineKeyboardButton("📥 خروجی اکسل (۱ ماه اخیر)", callback_data="sig_export_excel")],  # ← حذف این دکمه = پاک کن این خط
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")],
     ])
 
@@ -1357,6 +1448,20 @@ async def handle_signal(query, user_id, context):
     elif data == "sig_unsubscribe":
         remove_signal_subscriber(user_id)
         await query.edit_message_text("🔕 سیگنال‌ها غیرفعال شد.", reply_markup=signal_menu(user_id))
+
+    elif data == "sig_export_excel":  # ← حذف این بلوک = پاک کن این elif
+        rows = get_signals_since(days=30)
+        if not rows:
+            await query.answer("در ۱ ماه اخیر سیگنالی ثبت نشده.", show_alert=True)
+            return
+        await query.answer("⏳ در حال ساخت فایل اکسل...")
+        buffer = generate_signals_excel(rows)
+        await context.bot.send_document(
+            user_id,
+            document=buffer,
+            filename=f"signals_last30days_{get_iran_now().strftime('%Y-%m-%d')}.xlsx",
+            caption="📊 سیگنال‌های ۱ ماه اخیر"
+        )
 
     elif data == "sig_open_now":
         open_signals = get_open_signals()
@@ -3916,6 +4021,7 @@ def admin_panel_menu():
         [InlineKeyboardButton("📁 کتابخانه‌ی فایل و متن", callback_data="adm_library")],  # ← حذف کتابخانه = پاک کن این خط
         [InlineKeyboardButton("📡 شماره‌حساب‌های سیگنال", callback_data="adm_signal_accounts"),  # ← حذف ماژول سیگنال = پاک کن این خط
          InlineKeyboardButton("📥 اکسل ژورنال سیگنال‌ها", callback_data="adm_export_signals")],
+        [InlineKeyboardButton("📄 استیتمنت سیگنال (HTML)", callback_data="adm_signal_statement")],  # ← حذف = پاک کن این خط
         [InlineKeyboardButton("🔎 مدیریت سریع یک کاربر (با آیدی)", callback_data="adm_manage_user")],
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
@@ -4244,7 +4350,7 @@ async def handle_admin_panel(query, user_id, context):
 
     elif data == "adm_export_signals":
         await query.answer("⏳ در حال ساخت فایل اکسل...")
-        buffer = admin_generate_signals_excel()
+        buffer = generate_signals_excel(get_signals_since())
         await context.bot.send_document(
             ADMIN_ID,
             document=buffer,
@@ -4252,6 +4358,14 @@ async def handle_admin_panel(query, user_id, context):
             caption="📊 خروجی اکسل کامل ژورنال سیگنال‌ها"
         )
         await query.message.reply_text("👆 فایل اکسل ارسال شد.", reply_markup=admin_panel_menu())
+
+    elif data == "adm_signal_statement":  # ← حذف = پاک کن این بلوک
+        set_state(user_id, "adm_awaiting_statement_start")
+        await query.edit_message_text(
+            "📄 استیتمنت سیگنال (HTML)\n\n"
+            "تاریخ شروع را به فرمت YYYY-MM-DD بنویسید (میلادی).\n\nمثال: 2026-06-01",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="admin_panel")]])
+        )
 
     elif data == "adm_library":  # ← حذف کتابخانه = پاک کن این بلوک
         await query.edit_message_text("📁 کتابخانه‌ی فایل و متن:", reply_markup=admin_library_menu())
@@ -4506,6 +4620,41 @@ async def handle_admin_panel_message(user_id, text, update):
             await update.message.reply_text(f"✅ شماره‌حساب «{account_number}» اضافه شد.", reply_markup=admin_signal_accounts_menu())
         except sqlite3.IntegrityError:
             await update.message.reply_text("❌ این شماره‌حساب قبلاً ثبت شده. یک شماره‌ی دیگر وارد کنید:")
+        return True
+
+    elif state == "adm_awaiting_statement_start":  # ← حذف = پاک کن این ۲ بلوک elif
+        start_date = text.strip()
+        try:
+            datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            await update.message.reply_text("❌ فرمت درست نیست. به شکل YYYY-MM-DD بنویسید، مثلاً 2026-06-01:")
+            return True
+        set_state(user_id, "adm_awaiting_statement_end", start_date)
+        await update.message.reply_text("✅ ثبت شد.\n\nحالا تاریخ پایان را وارد کنید (میلادی، مثال: 2026-06-30):")
+        return True
+
+    elif state == "adm_awaiting_statement_end":
+        end_date = text.strip()
+        try:
+            datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            await update.message.reply_text("❌ فرمت درست نیست. به شکل YYYY-MM-DD بنویسید، مثلاً 2026-06-30:")
+            return True
+        start_date = data
+        clear_state(user_id)
+        rows = get_signals_since(start_date=start_date, end_date=end_date)
+        if not rows:
+            await update.message.reply_text("📭 در این بازه هیچ سیگنالی ثبت نشده.", reply_markup=admin_panel_menu())
+            return True
+        html_content = generate_signals_statement_html(rows, start_date, end_date)
+        html_buffer = io.BytesIO(html_content.encode("utf-8"))
+        await context.bot.send_document(
+            ADMIN_ID,
+            document=html_buffer,
+            filename=f"statement_{start_date}_to_{end_date}.html",
+            caption=f"📄 استیتمنت سیگنال از {start_date} تا {end_date}\n\n(فایل را دانلود و با مرورگر گوشی باز کنید)"
+        )
+        await update.message.reply_text("👆 استیتمنت ارسال شد.", reply_markup=admin_panel_menu())
         return True
 
     elif state == "adm_awaiting_new_file_label":  # ← حذف کتابخانه = پاک کن این ۴ بلوک elif
