@@ -74,6 +74,8 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS admin_texts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         label TEXT, content TEXT, created_at TEXT)''')  # ← حذف کتابخانه متن ادمین = پاک کن این خط
+    c.execute('''CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT)''')  # ← حذف چندادمینی = پاک کن این خط
     for col_def in [
         "ALTER TABLE users ADD COLUMN daily_msg INTEGER DEFAULT 1",
         "ALTER TABLE users ADD COLUMN referral_code TEXT",
@@ -87,6 +89,7 @@ def init_db():
         "ALTER TABLE users ADD COLUMN city TEXT",
         "ALTER TABLE users ADD COLUMN country TEXT",
         "ALTER TABLE users ADD COLUMN occupation TEXT",
+        "ALTER TABLE license_chats ADD COLUMN admin_id INTEGER",  # ← حذف چندادمینی = پاک کن این خط
     ]:
         try:
             c.execute(col_def)
@@ -102,6 +105,74 @@ def get_user(user_id):
     row = c.fetchone()
     conn.close()
     return row
+
+# ─── چندادمینی: ADMIN_ID (متغیر محیطی) همیشه «مالک اصلی» است و از ──
+# ─── طریق پنل قابل حذف نیست؛ ادمین‌های اضافه از جدول admins میان ──
+def is_admin(user_id):
+    """آیا این کاربر ادمین است؟ (مالک اصلی از ENV یا هر کسی که در جدول admins باشد)"""
+    if user_id == ADMIN_ID:
+        return True
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+def is_primary_admin(user_id):
+    """فقط مالک اصلی (ADMIN_ID از متغیر محیطی) -- برای عملیات حساس مثل افزودن/حذف ادمین دیگر"""
+    return user_id == ADMIN_ID
+
+def add_admin(user_id, added_by):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO admins (user_id, added_by, added_at) VALUES (?, ?, ?) "
+              "ON CONFLICT(user_id) DO NOTHING",
+              (user_id, added_by, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+def remove_admin(user_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_all_extra_admins():
+    """لیست ادمین‌های اضافه‌شده (بدون مالک اصلی) -- برای نمایش در پنل"""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT user_id, added_at FROM admins ORDER BY added_at")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_all_admin_ids():
+    """لیست همه‌ی آیدی‌های ادمین (مالک اصلی + همه‌ی ادمین‌های اضافه) -- برای اطلاع‌رسانی به همه"""
+    ids = {ADMIN_ID}
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM admins")
+    for row in c.fetchall():
+        ids.add(row[0])
+    conn.close()
+    return list(ids)
+
+async def notify_admins(bot, text, reply_markup=None):
+    """
+    ارسال یک پیام متنی به همه‌ی ادمین‌ها (مالک اصلی + همه‌ی ادمین‌های
+    اضافه‌شده از پنل). اگه پیام یه دکمه‌ی عمل (مثل «آماده‌ام ارسال کنم»)
+    داشته باشه، همون دکمه برای همه‌ی ادمین‌ها فرستاده می‌شه؛ هر کدوم
+    اول بزنه، همون درخواست رو به عهده می‌گیره (چون state با آیدی خودِ
+    همون ادمین ذخیره می‌شه، نه یه مقدار ثابت). ورودی bot می‌تواند
+    context.bot یا update.get_bot() باشد -- هر دو یک شیء Bot هستند.
+    """
+    for aid in get_all_admin_ids():
+        try:
+            await bot.send_message(aid, text, reply_markup=reply_markup)
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی به ادمین {aid}: {e}")
 
 def log_failed_request(user_id, module, query_text):
     """ثبت درخواستی که هیچ نتیجه‌ای برایش پیدا نشد (برای بررسی بعدی توسط ادمین)"""
@@ -188,6 +259,7 @@ def approve_user_by_referral(user_id):
               (now.strftime("%Y-%m-%d %H:%M"), expires.strftime("%Y-%m-%d %H:%M"), user_id))
     conn.commit()
     conn.close()
+    set_state(user_id, "first_active_start_pending")  # ← حذف تور خوش‌آمد = پاک کن این خط
 
 def approve_user(user_id):
     now = get_iran_now()
@@ -198,6 +270,7 @@ def approve_user(user_id):
               (now.strftime("%Y-%m-%d %H:%M"), expires.strftime("%Y-%m-%d %H:%M"), user_id))
     conn.commit()
     conn.close()
+    set_state(user_id, "first_active_start_pending")  # ← حذف تور خوش‌آمد = پاک کن این خط
 
 def reject_user(user_id):
     conn = sqlite3.connect("bot.db")
@@ -541,7 +614,7 @@ def create_license_chat(user_id):
 def get_license_chat(chat_id):
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("SELECT user_id, status FROM license_chats WHERE id=?", (chat_id,))
+    c.execute("SELECT user_id, status, admin_id FROM license_chats WHERE id=?", (chat_id,))
     row = c.fetchone()
     conn.close()
     return row
@@ -550,6 +623,14 @@ def update_license_chat_status(chat_id, status):
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
     c.execute("UPDATE license_chats SET status=? WHERE id=?", (status, chat_id))
+    conn.commit()
+    conn.close()
+
+def assign_license_chat_admin(chat_id, admin_id):
+    """ثبت این‌که کدام ادمین مسئول این مکالمه‌ی لایسنس است -- برای مسیریابی درست پیام‌های کاربر"""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("UPDATE license_chats SET admin_id=? WHERE id=?", (admin_id, chat_id))
     conn.commit()
     conn.close()
 
@@ -815,33 +896,27 @@ async def handle_financial(query, user_id, context):
                     "✅ نسخه‌ی تست برای شما ارسال شد؛ لطفاً پیام‌های چت را بررسی کنید.",
                     reply_markup=capital_bot_menu()
                 )
-                try:
-                    await context.bot.send_message(
-                        ADMIN_ID,
-                        f"ℹ️ نسخه‌ی تست به‌صورت خودکار برای {requester.first_name} "
-                        f"(@{requester.username or 'ندارد'}, {user_id}) ارسال شد."
-                    )
-                except Exception as e:
-                    print(f"خطای اطلاع کوتاه ادمین از ارسال خودکار تست: {e}")
+                await notify_admins(
+                    context.bot,
+                    f"ℹ️ نسخه‌ی تست به‌صورت خودکار برای {requester.first_name} "
+                    f"(@{requester.username or 'ندارد'}, {user_id}) ارسال شد."
+                )
                 return
             # اگر ارسال خودکار خطا داد (مثلاً file_id دیگر معتبر نیست)، به مسیر دستی زیر می‌رویم
 
         # فایل تست هنوز تنظیم نشده (یا ارسال خودکارش خطا داد) -- به ادمین اطلاع بده
         request_id = save_capital_request(user_id)
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"🎁 درخواست نسخه‌ی تست ۷ روزه (فایل تست خودکار تنظیم نشده)\n\n"
-                f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
-                f"🆔 آیدی: {user_id}\n\n"
-                f"می‌توانید از پنل مدیریت، فایل تست را یک‌بار تنظیم کنید تا از این پس "
-                f"خودکار ارسال شود، یا همین یک‌بار با دکمه‌ی زیر دستی برایش بفرستید.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📤 آماده‌ام ارسال کنم", callback_data=f"admin_send_capital_{request_id}")]
-                ])
-            )
-        except Exception as e:
-            print(f"خطای اطلاع‌رسانی درخواست نسخه‌ی تست به ادمین: {e}")
+        await notify_admins(
+            context.bot,
+            f"🎁 درخواست نسخه‌ی تست ۷ روزه (فایل تست خودکار تنظیم نشده)\n\n"
+            f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
+            f"🆔 آیدی: {user_id}\n\n"
+            f"می‌توانید از پنل مدیریت، فایل تست را یک‌بار تنظیم کنید تا از این پس "
+            f"خودکار ارسال شود، یا همین یک‌بار با دکمه‌ی زیر دستی برایش بفرستید.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 آماده‌ام ارسال کنم", callback_data=f"admin_send_capital_{request_id}")]
+            ])
+        )
         await query.edit_message_text(
             "✅ درخواست شما ثبت شد؛ ادمین به‌زودی نسخه‌ی تست را برایتان ارسال می‌کند.",
             reply_markup=capital_bot_menu()
@@ -866,20 +941,17 @@ async def handle_financial(query, user_id, context):
     elif data == "cap_paid_confirm":
         requester = query.from_user
         chat_id = create_license_chat(user_id)
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"💳 درخواست نسخه‌ی پولی (لایسنس) ربات مدیریت سرمایه\n\n"
-                f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
-                f"🆔 آیدی: {user_id}\n\n"
-                f"برای شروع مکالمه‌ی دوطرفه (متن/عکس/فایل/صدا/ویدیو، شامل فوروارد از "
-                f"کانال‌های دیگر) با این کاربر، دکمه‌ی زیر را بزنید.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ شروع مکالمه", callback_data=f"lic_start_{chat_id}")]
-                ])
-            )
-        except Exception as e:
-            print(f"خطای اطلاع‌رسانی درخواست لایسنس به ادمین: {e}")
+        await notify_admins(
+            context.bot,
+            f"💳 درخواست نسخه‌ی پولی (لایسنس) ربات مدیریت سرمایه\n\n"
+            f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
+            f"🆔 آیدی: {user_id}\n\n"
+            f"برای شروع مکالمه‌ی دوطرفه (متن/عکس/فایل/صدا/ویدیو، شامل فوروارد از "
+            f"کانال‌های دیگر) با این کاربر، دکمه‌ی زیر را بزنید.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ شروع مکالمه", callback_data=f"lic_start_{chat_id}")]
+            ])
+        )
         await query.edit_message_text(
             "✅ درخواست شما برای ادمین ارسال شد؛ به‌زودی مکالمه شروع می‌شود.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")]])
@@ -1138,6 +1210,18 @@ JALALI_MONTH_NAMES_FA = [
     "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"
 ]
 
+_PERSIAN_DIGITS_MAP = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+def to_persian_digits(value):
+    """
+    تبدیل ارقام لاتین به فارسی در یک رشته یا عدد -- برای یکدست کردن
+    نمایش تاریخ/ساعت/شمارش به کاربر. فقط برای محتوای فارسیِ خواندنی
+    استفاده می‌شود (تاریخ شمسی، ساعت)؛ عمداً برای اعداد مالی/قیمت
+    (دلار، لات، پیپ) و آیدی‌های عددی (که استاندارد جهانی لاتین دارند)
+    استفاده نمی‌شود، چون تبدیل آن‌ها غیرمعمول و کمتر خوانا می‌شود.
+    """
+    return str(value).translate(_PERSIAN_DIGITS_MAP)
+
 def format_date_fa(dt_str_or_obj, with_time=True):
     """
     تابع مرکزی فرمت‌دهی تاریخ/ساعت برای نمایش به کاربر -- طبق تصمیم شما،
@@ -1145,6 +1229,9 @@ def format_date_fa(dt_str_or_obj, with_time=True):
     رشته‌ی ذخیره‌شده در دیتابیس (فرمت "%Y-%m-%d %H:%M" یا "%Y-%m-%d") یا
     مستقیم یک شیء datetime باشد. ذخیره‌سازی داخلی در دیتابیس همچنان
     میلادی باقی می‌ماند -- این تابع فقط برای نمایش نهایی به کاربر است.
+    بخش شمسی و ساعت با ارقام فارسی نمایش داده می‌شود (طبق قرارداد رایج
+    فارسی‌نویسی)؛ بخش میلادی داخل پرانتز عمداً با ارقام لاتین می‌ماند
+    (چون یک قالب مرجع/فنی است، مثل تاریخ‌های ISO).
     خروجی نمونه: "۱۸ تیر ۱۴۰۵ (2026-07-09) ساعت ۲۳:۲۸"
     """
     if isinstance(dt_str_or_obj, str):
@@ -1159,11 +1246,11 @@ def format_date_fa(dt_str_or_obj, with_time=True):
         dt = dt_str_or_obj
 
     jy, jm, jd = gregorian_to_jalali(dt.year, dt.month, dt.day)
-    jalali_str = f"{jd} {JALALI_MONTH_NAMES_FA[jm-1]} {jy}"
+    jalali_str = to_persian_digits(f"{jd} {JALALI_MONTH_NAMES_FA[jm-1]} {jy}")
     gregorian_str = dt.strftime("%Y-%m-%d")
 
     if with_time and (dt.hour or dt.minute):
-        time_str = dt.strftime("%H:%M")
+        time_str = to_persian_digits(dt.strftime("%H:%M"))
         return f"{jalali_str} ({gregorian_str}) ساعت {time_str}"
     return f"{jalali_str} ({gregorian_str})"
 
@@ -2891,21 +2978,18 @@ async def handle_fun_message(user_id, text, update):
         # پیدا کردن آهنگ در کانال، مستقیم از طریق ربات برای همین کاربر بفرستد
         requester = update.effective_user
         request_id = save_music_request(user_id, query_text)
-        try:
-            await update.get_bot().send_message(
-                ADMIN_ID,
-                f"🎵 درخواست آهنگ جدید\n\n"
-                f"🔍 جستجو: {query_text}\n"
-                f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
-                f"🆔 آیدی: {user_id}\n\n"
-                f"اگر این آهنگ را در کانال @LiteMusics پیدا کردید، روی دکمه‌ی زیر بزنید "
-                f"و فایل صوتی را برای من (در همین چت) بفرستید تا خودکار برای کاربر ارسال شود.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📤 آماده‌ام فایل را بفرستم", callback_data=f"admin_send_music_{request_id}")]
-                ])
-            )
-        except Exception as e:
-            print(f"خطای اطلاع‌رسانی درخواست موزیک به ادمین: {e}")
+        await notify_admins(
+            update.get_bot(),
+            f"🎵 درخواست آهنگ جدید\n\n"
+            f"🔍 جستجو: {query_text}\n"
+            f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
+            f"🆔 آیدی: {user_id}\n\n"
+            f"اگر این آهنگ را در کانال @LiteMusics پیدا کردید، روی دکمه‌ی زیر بزنید "
+            f"و فایل صوتی را برای من (در همین چت) بفرستید تا خودکار برای کاربر ارسال شود.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 آماده‌ام فایل را بفرستم", callback_data=f"admin_send_music_{request_id}")]
+            ])
+        )
 
         # ۱) اول از همه، پیشنهاد جستجوی مستقیم در کانال موزیک تلگرام
         # (اکثر آهنگ‌های فارسی معمولاً همان‌جا پیدا می‌شوند)
@@ -3291,19 +3375,16 @@ async def handle_settings_message(user_id, text, update, context):
         clear_state(user_id)
         message_id = save_user_admin_message(user_id, message_text)
         requester = update.effective_user
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"📩 پیام جدید از کاربر\n\n"
-                f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
-                f"🆔 آیدی: {user_id}\n\n"
-                f"💬 متن پیام:\n{message_text}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("↩️ پاسخ بده", callback_data=f"admin_reply_msg_{message_id}")]
-                ])
-            )
-        except Exception as e:
-            print(f"خطای اطلاع‌رسانی پیام کاربر به ادمین: {e}")
+        await notify_admins(
+            context.bot,
+            f"📩 پیام جدید از کاربر\n\n"
+            f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
+            f"🆔 آیدی: {user_id}\n\n"
+            f"💬 متن پیام:\n{message_text}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ پاسخ بده", callback_data=f"admin_reply_msg_{message_id}")]
+            ])
+        )
         await update.message.reply_text(
             "✅ پیام شما ارسال شد؛ ادمین به‌زودی پاسخ می‌دهد.",
             reply_markup=settings_menu()
@@ -3472,7 +3553,7 @@ async def handle_antifilter(query, user_id):
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              MODULE: ADMIN PANEL (پنل مدیریت)                ║
-# ║  فقط برای ADMIN_ID قابل دسترسی است. شامل: لیست کاربران،       ║
+# ║  فقط برای ادمین‌ها قابل دسترسی است (مالک اصلی + هر کسی که از    ║
 # ║  لیست اندیکاتورهای شخصی ارسالی، آمار کلی، مسدود/فعال کردن     ║
 # ║  سریع، و لاگ درخواست‌های ناموفق.                               ║
 # ║  برای حذف: این بلوک رو پاک کن                                 ║
@@ -3597,8 +3678,17 @@ def admin_panel_menu():
         [InlineKeyboardButton("📶 لیست اندیکاتورهای شخصی ارسالی", callback_data="adm_indicators")],
         [InlineKeyboardButton("📁 کتابخانه‌ی فایل و متن", callback_data="adm_library")],  # ← حذف کتابخانه = پاک کن این خط
         [InlineKeyboardButton("🔎 مدیریت سریع یک کاربر (با آیدی)", callback_data="adm_manage_user")],
+        [InlineKeyboardButton("👥 مدیریت ادمین‌ها", callback_data="adm_manage_admins")],  # ← حذف چندادمینی = پاک کن این خط
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
+
+def admin_manage_admins_menu():
+    extra_admins = get_all_extra_admins()
+    rows = [[InlineKeyboardButton(f"🗑 {uid} (اضافه‌شده {added_at})", callback_data=f"adm_remove_admin_{uid}")]
+            for uid, added_at in extra_admins]
+    rows.append([InlineKeyboardButton("➕ افزودن ادمین جدید", callback_data="adm_add_admin")])
+    rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
 
 def admin_library_menu():
     return InlineKeyboardMarkup([
@@ -3607,6 +3697,7 @@ def admin_library_menu():
         [InlineKeyboardButton("📚 فایل‌های آماده (حداکثر ۱۰)", callback_data="adm_files_list"),
          InlineKeyboardButton("💬 متن‌های آماده", callback_data="adm_texts_list")],
         [InlineKeyboardButton("💰 متن قیمت‌گذاری لایسنس", callback_data="adm_set_pricing_text")],  # ← حذف = پاک کن این خط
+        [InlineKeyboardButton("❓ متن راهنما", callback_data="adm_set_help_text")],  # ← حذف راهنما = پاک کن این خط
         [InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")],
     ])
 
@@ -3641,7 +3732,7 @@ def license_chat_action_menu(chat_id):
     ])
 
 async def handle_admin_panel(query, user_id, context):
-    if user_id != ADMIN_ID:
+    if not is_admin(user_id):
         await query.answer("⛔ این بخش فقط برای ادمین است.", show_alert=True)
         return
 
@@ -3717,7 +3808,7 @@ async def handle_admin_panel(query, user_id, context):
         import json
         set_state(user_id, "adm_broadcast_ready",
                    json.dumps({"target_ids": target_ids, "file_type": file_type, "file_id": file_id, "caption": caption}))
-        await send_content_by_type(context, ADMIN_ID, file_type, file_id, caption, default_caption=label)
+        await send_content_by_type(context, user_id, file_type, file_id, caption, default_caption=label)
         await query.message.reply_text(
             f"👆 پیش‌نمایش بالا. این محتوا به {len(target_ids)} کاربر ارسال خواهد شد. تأیید می‌کنید؟",
             reply_markup=InlineKeyboardMarkup([
@@ -3846,7 +3937,7 @@ async def handle_admin_panel(query, user_id, context):
         await query.answer("⏳ در حال ساخت فایل اکسل...")
         buffer = admin_generate_users_excel()
         await context.bot.send_document(
-            ADMIN_ID,
+            user_id,
             document=buffer,
             filename=f"users_{get_iran_now().strftime('%Y-%m-%d_%H-%M')}.xlsx",
             caption="📊 خروجی اکسل کامل لیست کاربران (همه‌ی فیلدهای پروفایل)"
@@ -3898,6 +3989,16 @@ async def handle_admin_panel(query, user_id, context):
             f"💰 متن جدید قیمت‌گذاری لایسنس را بنویسید (شامل قیمت‌های ۳/۶/۱۲ ماهه و روش پرداخت). "
             f"همین متن دقیقاً به کاربر نمایش داده می‌شود.{preview}"
         )[:4000]
+        await query.edit_message_text(
+            full_text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")]])
+        )
+
+    elif data == "adm_set_help_text":  # ← حذف راهنما = پاک کن این بلوک
+        set_state(user_id, "adm_awaiting_help_text")
+        current = get_bot_setting("help_text")
+        preview = f"\n\nمتن فعلی:\n\n{current}" if current else "\n\n(هنوز متنی تنظیم نشده؛ فعلاً متن پیش‌فرض عمومی نمایش داده می‌شود.)"
+        full_text = f"❓ متن جدید راهنما را بنویسید. همین متن دقیقاً به کاربر نمایش داده می‌شود.{preview}"[:4000]
         await query.edit_message_text(
             full_text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="adm_library")]])
@@ -3962,7 +4063,7 @@ async def handle_admin_panel(query, user_id, context):
             await query.answer("این فایل پیدا نشد.", show_alert=True)
             return
         label, file_type, file_id, caption = row
-        await send_content_by_type(context, ADMIN_ID, file_type, file_id, caption, default_caption=label)
+        await send_content_by_type(context, user_id, file_type, file_id, caption, default_caption=label)
         await query.answer("✅ برای شما ارسال شد.")
 
     elif data.startswith("adm_file_del_"):
@@ -4038,6 +4139,43 @@ async def handle_admin_panel(query, user_id, context):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")]])
         )
 
+    elif data == "adm_manage_admins":  # ← حذف چندادمینی = پاک کن این ۴ بلوک elif
+        if not is_primary_admin(user_id):
+            await query.answer("⛔ فقط مالک اصلی ربات می‌تواند ادمین‌ها را مدیریت کند.", show_alert=True)
+            return
+        extra_admins = get_all_extra_admins()
+        count_line = f"تعداد ادمین‌های اضافه‌شده: {len(extra_admins)}"
+        await query.edit_message_text(
+            f"👥 مدیریت ادمین‌ها\n\n{count_line}\n\n"
+            f"ادمین اصلی (مالک ربات) همیشه ثابت است و از اینجا قابل حذف نیست.",
+            reply_markup=admin_manage_admins_menu()
+        )
+
+    elif data == "adm_add_admin":
+        if not is_primary_admin(user_id):
+            await query.answer("⛔ فقط مالک اصلی ربات می‌تواند ادمین‌ها را مدیریت کند.", show_alert=True)
+            return
+        set_state(user_id, "adm_awaiting_new_admin_id")
+        await query.edit_message_text(
+            "آیدی عددی تلگرام فردی که می‌خواهید ادمین شود را وارد کنید.\n\n"
+            "(کاربر باید حداقل یک‌بار /start ربات را زده باشد تا بتوانیم بهش پیام بدهیم؛ "
+            "برای گرفتن آیدی عددی هرکسی می‌توانید از ربات‌هایی مثل @userinfobot کمک بگیرید.)",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="adm_manage_admins")]])
+        )
+
+    elif data.startswith("adm_remove_admin_"):
+        if not is_primary_admin(user_id):
+            await query.answer("⛔ فقط مالک اصلی ربات می‌تواند ادمین‌ها را مدیریت کند.", show_alert=True)
+            return
+        target_admin_id = int(data.replace("adm_remove_admin_", ""))
+        remove_admin(target_admin_id)
+        clear_state(target_admin_id)  # اگه وسط یه کاری بود، حالتش پاک بشه که گیر نکنه
+        try:
+            await context.bot.send_message(target_admin_id, "ℹ️ دسترسی ادمین شما به این ربات لغو شد.")
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی لغو دسترسی ادمین: {e}")
+        await query.edit_message_text("✅ حذف شد.", reply_markup=admin_manage_admins_menu())
+
     elif data.startswith("adm_block_") or data.startswith("adm_activate_"):
         target_uid = int(data.split("_")[-1])
         is_activate = data.startswith("adm_activate_")
@@ -4059,7 +4197,7 @@ async def handle_admin_panel(query, user_id, context):
             print(f"خطای اطلاع‌رسانی تغییر وضعیت به کاربر: {e}")
 
 async def handle_admin_panel_message(user_id, text, update):
-    if user_id != ADMIN_ID:
+    if not is_admin(user_id):
         return False
     state, data = get_state(user_id)
 
@@ -4128,6 +4266,40 @@ async def handle_admin_panel_message(user_id, text, update):
         set_bot_setting("pricing_text", text.strip())
         clear_state(user_id)
         await update.message.reply_text("✅ متن قیمت‌گذاری ذخیره شد.", reply_markup=admin_library_menu())
+        return True
+
+    elif state == "adm_awaiting_help_text":  # ← حذف راهنما = پاک کن این بلوک
+        set_bot_setting("help_text", text.strip())
+        clear_state(user_id)
+        await update.message.reply_text("✅ متن راهنما ذخیره شد.", reply_markup=admin_library_menu())
+        return True
+
+    elif state == "adm_awaiting_new_admin_id":  # ← حذف چندادمینی = پاک کن این بلوک
+        if not is_primary_admin(user_id):
+            clear_state(user_id)
+            return True
+        try:
+            new_admin_id = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ لطفاً فقط آیدی عددی وارد کنید:")
+            return True
+        if is_admin(new_admin_id):
+            clear_state(user_id)
+            await update.message.reply_text("این فرد از قبل ادمین است.", reply_markup=admin_manage_admins_menu())
+            return True
+        add_admin(new_admin_id, added_by=user_id)
+        clear_state(user_id)
+        try:
+            await update.get_bot().send_message(
+                new_admin_id,
+                "🎉 شما به‌عنوان ادمین این ربات تعیین شدید؛ حالا از منوی اصلی «🛠 پنل مدیریت» را می‌بینید."
+            )
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی به ادمین جدید: {e}")
+        await update.message.reply_text(
+            f"✅ کاربر {new_admin_id} به‌عنوان ادمین اضافه شد.",
+            reply_markup=admin_manage_admins_menu()
+        )
         return True
 
     elif state == "adm_awaiting_new_file_label":  # ← حذف کتابخانه = پاک کن این ۴ بلوک elif
@@ -7559,12 +7731,13 @@ async def handle_custom_indicator_message(user_id, text, update):
 
         try:
             code_bytes = code.encode("utf-8")
-            await update.get_bot().send_document(
-                ADMIN_ID,
-                document=io.BytesIO(code_bytes),
-                filename=f"ai_generated_indicator_{user_id}.py",
-                caption=f"🤖 کد اندیکاتور تولیدشده توسط AI\n👤 کاربر: {user_id}\n📝 توضیح: {description}"
-            )
+            for aid in get_all_admin_ids():
+                await update.get_bot().send_document(
+                    aid,
+                    document=io.BytesIO(code_bytes),
+                    filename=f"ai_generated_indicator_{user_id}.py",
+                    caption=f"🤖 کد اندیکاتور تولیدشده توسط AI\n👤 کاربر: {user_id}\n📝 توضیح: {description}"
+                )
         except Exception as e:
             print(f"خطا در ارسال کد به ادمین: {e}")
 
@@ -7616,12 +7789,13 @@ async def handle_custom_indicator_document(update, context):
         return True
 
     try:
-        await context.bot.send_document(
-            ADMIN_ID,
-            document=io.BytesIO(bytes(file_bytes)),
-            filename=f"user_indicator_{user_id}_{doc.file_name}",
-            caption=f"📄 کد اندیکاتور شخصی ارسال‌شده توسط کاربر\n👤 کاربر: {user_id}"
-        )
+        for aid in get_all_admin_ids():
+            await context.bot.send_document(
+                aid,
+                document=io.BytesIO(bytes(file_bytes)),
+                filename=f"user_indicator_{user_id}_{doc.file_name}",
+                caption=f"📄 کد اندیکاتور شخصی ارسال‌شده توسط کاربر\n👤 کاربر: {user_id}"
+            )
     except Exception as e:
         print(f"خطا در ارسال فایل کاربر به ادمین: {e}")
 
@@ -7684,6 +7858,18 @@ async def handle_custom_indicator_document(update, context):
 # ║  برای حذف دکمه: اون خط رو پاک کن                           ║
 # ╚══════════════════════════════════════════════════════════════╝
 
+DEFAULT_HELP_TEXT = (
+    "❓ راهنمای ربات\n\n"
+    "💰 بازارهای مالی: قیمت لحظه‌ای طلا/ارز/کریپتو، واچ‌لیست، هشدار قیمت، "
+    "تحلیل هوش مصنوعی، بک‌تست استراتژی، ربات مدیریت سرمایه (نسخه‌ی تست و لایسنس)\n\n"
+    "🎮 سرگرمی: پیگیری سلامت و ورزش خانواده، جستجوی موزیک\n\n"
+    "👶 فرزندان: قصه‌گویی هوشمند، ثبت و یادآوری تکالیف\n\n"
+    "⏰ یادآور و تسک: یادآور‌های یک‌باره یا تکرارشونده\n\n"
+    "🛠 ابزارهای کاربردی: دستیار هوش مصنوعی، فیلترشکن\n\n"
+    "⚙️ تنظیمات: پروفایل، تکمیل اطلاعات، پیام به ادمین\n\n"
+    "سوالی داشتید، از ⚙️ تنظیمات → 📩 پیام به ادمین استفاده کنید."
+)
+
 def main_menu(user_id=None):
     rows = [
         [InlineKeyboardButton("💰 بازارهای مالی", callback_data="menu_financial"),      # ← حذف = پاک کن این خط
@@ -7692,8 +7878,9 @@ def main_menu(user_id=None):
          InlineKeyboardButton("⏰ یادآور و تسک", callback_data="menu_reminder")],       # ← حذف = پاک کن این خط
         [InlineKeyboardButton("🛠 ابزارهای کاربردی", callback_data="menu_tools"),       # ← حذف ماژول ابزارها = پاک کن این خط
          InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings")],            # ← حذف = پاک کن این خط
+        [InlineKeyboardButton("❓ راهنما", callback_data="menu_help")],                 # ← حذف راهنما = پاک کن این خط
     ]
-    if user_id == ADMIN_ID:
+    if is_admin(user_id):
         rows.append([InlineKeyboardButton("🛠 پنل مدیریت", callback_data="admin_panel")])  # ← حذف ماژول پنل ادمین = پاک کن این خط
     return InlineKeyboardMarkup(rows)
 
@@ -7717,19 +7904,17 @@ def membership_choice_menu():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     was_new_user = get_user(user.id) is None
+    prior_state, _ = get_state(user.id)  # قبل از پاک شدن می‌خوانیمش تا بفهمیم اولین /start بعد از تأیید است یا نه
     save_user(user.id, user.username or "", user.first_name)
     ensure_referral_code(user.id)
     clear_state(user.id)
 
     # ─── اطلاع‌رسانی فقط برای ورود اول (عضویت جدید) به ادمین ───
-    if user.id != ADMIN_ID and was_new_user:
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"🆕 کاربر جدید\n👤 {user.first_name}\n🆔 {user.id}\n📛 @{user.username or 'ندارد'}"
-            )
-        except Exception as e:
-            print(f"خطای اطلاع‌رسانی ورود به ادمین: {e}")
+    if not is_admin(user.id) and was_new_user:
+        await notify_admins(
+            context.bot,
+            f"🆕 کاربر جدید\n👤 {user.first_name}\n🆔 {user.id}\n📛 @{user.username or 'ندارد'}"
+        )
 
     # ─── پردازش لینک دعوت (/start R123456) ───
     if context.args:
@@ -7773,10 +7958,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if get_iran_now() >= expires:
             reject_user(user.id)
             await update.message.reply_text(f"⏳ {user.first_name} عزیز،\nاشتراک شما منقضی شده.")
-            await context.bot.send_message(ADMIN_ID, f"🔄 منقضی:\n👤 {user.first_name}\n🆔 {user.id}")
+            await notify_admins(context.bot, f"🔄 منقضی:\n👤 {user.first_name}\n🆔 {user.id}")
             return
-        await update.message.reply_text(f"✅ {user.first_name} عزیز، خوش آمدید!\n\n🏠 منوی اصلی:",
-            reply_markup=main_menu(user.id))
+        if prior_state == "first_active_start_pending":
+            await update.message.reply_text(
+                f"✅ {user.first_name} عزیز، خوش آمدید! 🎉\n\n"
+                f"این چند بخش اصلی ربات هستند:\n\n"
+                f"💰 بازارهای مالی — قیمت لحظه‌ای، هشدار قیمت، تحلیل هوش مصنوعی، ربات مدیریت سرمایه\n"
+                f"🎮 سرگرمی — سلامت خانواده، موزیک\n"
+                f"👶 فرزندان — قصه‌گویی هوشمند، یادآور تکالیف\n"
+                f"⏰ یادآور و تسک\n"
+                f"🛠 ابزارهای کاربردی — دستیار هوش مصنوعی، فیلترشکن\n\n"
+                f"هر وقت خواستید توضیح کامل‌تر ببینید، دکمه‌ی ❓ راهنما را بزنید.\n\n"
+                f"🏠 منوی اصلی:",
+                reply_markup=main_menu(user.id)
+            )
+        else:
+            await update.message.reply_text(f"✅ {user.first_name} عزیز، خوش آمدید!\n\n🏠 منوی اصلی:",
+                reply_markup=main_menu(user.id))
         return
 
     if db_user[3] == 'rejected':
@@ -7799,6 +7998,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ─── ادمین ───
     if data.startswith("approve_") or data.startswith("reject_"):
+        if not is_admin(user_id):
+            await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
+            return
         action, uid = data.split("_")
         uid = int(uid)
         target = get_user(uid)
@@ -7824,18 +8026,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "join_admin":
         if db_user and db_user[3] == 'pending':
             await query.edit_message_text("✅ درخواست شما ثبت شد.\n⏳ منتظر تأیید ادمین باشید.")
-            try:
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"🔔 کاربر جدید (درخواست تأیید ادمین):\n👤 {query.from_user.first_name}\n"
-                    f"🆔 {user_id}\n📛 @{query.from_user.username or 'ندارد'}",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ تأیید", callback_data=f"approve_{user_id}"),
-                        InlineKeyboardButton("❌ رد", callback_data=f"reject_{user_id}")
-                    ]])
-                )
-            except Exception as e:
-                print(f"خطای اطلاع به ادمین: {e}")
+            await notify_admins(
+                context.bot,
+                f"🔔 کاربر جدید (درخواست تأیید ادمین):\n👤 {query.from_user.first_name}\n"
+                f"🆔 {user_id}\n📛 @{query.from_user.username or 'ندارد'}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ تأیید", callback_data=f"approve_{user_id}"),
+                    InlineKeyboardButton("❌ رد", callback_data=f"reject_{user_id}")
+                ]])
+            )
         return
 
     if data == "join_referral":
@@ -7887,7 +8086,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_custom_indicator(query, user_id)  # ← حذف ماژول اندیکاتور شخصی = پاک کن این خط
 
     elif data.startswith("admin_send_music_"):
-        if user_id != ADMIN_ID:
+        if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
             return
         request_id = int(data.replace("admin_send_music_", ""))
@@ -7896,13 +8095,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("این درخواست پیدا نشد.", show_alert=True)
             return
         requester_user_id, request_query_text, fulfilled = request_row
-        set_state(ADMIN_ID, "admin_awaiting_music_file", str(request_id))
+        set_state(user_id, "admin_awaiting_music_file", str(request_id))
         await query.edit_message_text(
             f"📤 فایل صوتی «{request_query_text}» را همین‌جا بفرستید تا خودکار برای کاربر ارسال شود."
         )
 
     elif data.startswith("admin_send_capital_"):  # ← حذف ماژول ربات مدیریت سرمایه = پاک کن این خط
-        if user_id != ADMIN_ID:
+        if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
             return
         request_id = int(data.replace("admin_send_capital_", ""))
@@ -7910,7 +8109,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not request_row:
             await query.answer("این درخواست پیدا نشد.", show_alert=True)
             return
-        set_state(ADMIN_ID, "admin_awaiting_capital_content", str(request_id))
+        set_state(user_id, "admin_awaiting_capital_content", str(request_id))
         await query.edit_message_text(
             "📤 متن، عکس، فایل، صدا یا ویدیوی موردنظر را همین‌جا بفرستید.\n"
             "می‌توانید چند پیام پشت‌سرهم بفرستید؛ وقتی کارتان تمام شد، دکمه‌ی «✅ پایان ارسال» را بزنید.",
@@ -7920,15 +8119,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("admin_finish_capital_"):  # ← حذف ماژول ربات مدیریت سرمایه = پاک کن این خط
-        if user_id != ADMIN_ID:
+        if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
             return
         request_id = int(data.replace("admin_finish_capital_", ""))
-        clear_state(ADMIN_ID)
+        clear_state(user_id)
         await query.edit_message_text(f"✅ ارسال برای این کاربر تمام شد (درخواست #{request_id}).")
 
     elif data.startswith("admin_reply_msg_"):  # ← حذف فیچر پیام به ادمین = پاک کن این بلوک
-        if user_id != ADMIN_ID:
+        if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
             return
         message_id = int(data.replace("admin_reply_msg_", ""))
@@ -7937,13 +8136,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("این پیام پیدا نشد.", show_alert=True)
             return
         target_user_id, message_text, replied = msg_row
-        set_state(ADMIN_ID, "admin_awaiting_reply_content", f"{message_id}:{target_user_id}")
+        set_state(user_id, "admin_awaiting_reply_content", f"{message_id}:{target_user_id}")
         await query.edit_message_text(
             "📤 متن، عکس، فایل، صدا یا ویدیوی پاسخ را همین‌جا بفرستید تا خودکار برای کاربر ارسال شود."
         )
 
     elif data.startswith("lic_start_"):  # ← حذف فیچر چت لایسنس = پاک کن این بلوک
-        if user_id != ADMIN_ID:
+        if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
             return
         chat_id = int(data.replace("lic_start_", ""))
@@ -7951,13 +8150,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not chat_row:
             await query.answer("این درخواست پیدا نشد.", show_alert=True)
             return
-        target_user_id, status = chat_row
+        target_user_id, status, _existing_admin_id = chat_row
         if status == "closed":
             await query.answer("این مکالمه قبلاً بسته شده.", show_alert=True)
             return
         update_license_chat_status(chat_id, "active")
-        set_state(ADMIN_ID, "admin_chat_active", f"{chat_id}:{target_user_id}")
-        set_state(target_user_id, "user_chat_active", str(chat_id))
+        assign_license_chat_admin(chat_id, user_id)
+        set_state(user_id, "admin_chat_active", f"{chat_id}:{target_user_id}")
+        set_state(target_user_id, "user_chat_active", f"{chat_id}:{user_id}")
         try:
             await context.bot.send_message(
                 target_user_id,
@@ -7973,7 +8173,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("lic_end_"):  # ← حذف فیچر چت لایسنس = پاک کن این بلوک
-        if user_id != ADMIN_ID:
+        if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
             return
         chat_id = int(data.replace("lic_end_", ""))
@@ -7981,9 +8181,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not chat_row:
             await query.answer("این مکالمه پیدا نشد.", show_alert=True)
             return
-        target_user_id, status = chat_row
+        target_user_id, status, chat_admin_id = chat_row
         update_license_chat_status(chat_id, "closed")
-        clear_state(ADMIN_ID)
+        clear_state(chat_admin_id or user_id)
         clear_state(target_user_id)
         await query.edit_message_text("✅ مکالمه بسته شد.")
         try:
@@ -7995,7 +8195,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"خطای اطلاع‌رسانی پایان مکالمه به کاربر: {e}")
 
     elif data.startswith("lic_send_paid_"):  # ← حذف کتابخانه/چت لایسنس = پاک کن این بلوک
-        if user_id != ADMIN_ID:
+        if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
             return
         chat_id = int(data.replace("lic_send_paid_", ""))
@@ -8118,6 +8318,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("menu_settings") or data.startswith("set_"):
         await handle_settings(query, user_id, context)  # ← حذف ماژول = پاک کن این خط
 
+    elif data == "menu_help":  # ← حذف راهنما = پاک کن این بلوک
+        help_text = get_bot_setting("help_text") or DEFAULT_HELP_TEXT
+        await query.edit_message_text(
+            help_text[:4000],
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="back_main")]])
+        )
+
     elif data.startswith("menu_antifilter") or data.startswith("af_"):
         await handle_antifilter(query, user_id)  # ← حذف ماژول فیلترشکن = پاک کن این خط
 
@@ -8186,6 +8393,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif state and state.startswith("rem_"):
         await handle_reminder_message(user_id, text, update)  # ← حذف ماژول یادآور = پاک کن این خط
 
+    else:
+        # یا هیچ state فعالی نبود، یا state موجود بود ولی منتظر دکمه بود نه متن
+        # (مثلاً انتخاب جهت آلارم) و کاربر به‌جای زدن دکمه متن فرستاد. قبلاً در
+        # هر دو حالت هیچ پاسخی داده نمی‌شد (سکوت کامل)؛ کاربر فکر می‌کرد ربات خراب شده
+        await update.message.reply_text(
+            "🤔 متوجه این پیام نشدم.\n\n"
+            "از دکمه‌های منو استفاده کنید، یا دستور /start را بزنید تا به منوی اصلی برگردید.\n"
+            "برای راهنما هم می‌توانید دستور /help را بزنید."
+        )
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                       RUN BOT                                ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -8243,9 +8460,9 @@ async def handle_admin_capital_content(update, context):
     به مسیر بعدی برود).
     """
     admin_user_id = update.effective_user.id
-    if admin_user_id != ADMIN_ID:
+    if not is_admin(admin_user_id):
         return False
-    state, data = get_state(ADMIN_ID)
+    state, data = get_state(admin_user_id)
     if state != "admin_awaiting_capital_content":
         return False
 
@@ -8253,7 +8470,7 @@ async def handle_admin_capital_content(update, context):
     request_row = get_capital_request(request_id)
     if not request_row:
         await update.message.reply_text("❌ این درخواست دیگر معتبر نیست.")
-        clear_state(ADMIN_ID)
+        clear_state(admin_user_id)
         return True
 
     requester_user_id, fulfilled = request_row
@@ -8290,9 +8507,9 @@ async def handle_admin_reply_content(update, context):
     خروجی: True اگر پردازش شد، False اگر این ماژول منتظر پاسخ نبود.
     """
     admin_user_id = update.effective_user.id
-    if admin_user_id != ADMIN_ID:
+    if not is_admin(admin_user_id):
         return False
-    state, data = get_state(ADMIN_ID)
+    state, data = get_state(admin_user_id)
     if state != "admin_awaiting_reply_content":
         return False
 
@@ -8302,7 +8519,7 @@ async def handle_admin_reply_content(update, context):
         target_user_id = int(target_user_id_str)
     except Exception:
         await update.message.reply_text("❌ خطای داخلی؛ لطفاً دوباره از پیام کاربر شروع کنید.")
-        clear_state(ADMIN_ID)
+        clear_state(admin_user_id)
         return True
 
     msg = update.message
@@ -8318,7 +8535,7 @@ async def handle_admin_reply_content(update, context):
 
     mark_user_admin_message_replied(message_id)
     await update.message.reply_text("✅ پاسخ برای کاربر ارسال شد.")
-    clear_state(ADMIN_ID)
+    clear_state(admin_user_id)
     return True
 
 async def handle_admin_keyed_file_upload(update, context):
@@ -8330,9 +8547,9 @@ async def handle_admin_keyed_file_upload(update, context):
     خروجی: True اگر پردازش شد، False در غیر این صورت.
     """
     admin_user_id = update.effective_user.id
-    if admin_user_id != ADMIN_ID:
+    if not is_admin(admin_user_id):
         return False
-    state, _ = get_state(ADMIN_ID)
+    state, _ = get_state(admin_user_id)
     state_map = {
         "adm_awaiting_trial_file_content": ("trial_file", "نسخه‌ی تست", admin_panel_menu()),
         "adm_awaiting_paid_file_content": ("paid_file", "نسخه‌ی پولی", admin_library_menu()),
@@ -8350,7 +8567,7 @@ async def handle_admin_keyed_file_upload(update, context):
     import json
     caption = msg.caption if file_type != "text" else msg.text
     set_bot_setting(setting_key, json.dumps({"file_type": file_type, "file_id": file_id, "caption": caption}))
-    clear_state(ADMIN_ID)
+    clear_state(admin_user_id)
     await update.message.reply_text(f"✅ فایل {label} ذخیره شد.", reply_markup=back_menu)
     return True
 
@@ -8362,9 +8579,9 @@ async def handle_admin_library_file_upload(update, context):
     دوم (گرفتن خود محتوا) را انجام می‌دهد. خروجی: True اگر پردازش شد.
     """
     admin_user_id = update.effective_user.id
-    if admin_user_id != ADMIN_ID:
+    if not is_admin(admin_user_id):
         return False
-    state, label = get_state(ADMIN_ID)
+    state, label = get_state(admin_user_id)
     if state != "adm_awaiting_new_file_content":
         return False
 
@@ -8373,7 +8590,7 @@ async def handle_admin_library_file_upload(update, context):
             "⛔ در حال حاضر ۱۰ فایل ثبت شده (حداکثر مجاز). اول یکی را از لیست حذف کنید.",
             reply_markup=admin_library_menu()
         )
-        clear_state(ADMIN_ID)
+        clear_state(admin_user_id)
         return True
 
     msg = update.message
@@ -8384,7 +8601,7 @@ async def handle_admin_library_file_upload(update, context):
 
     caption = msg.caption if file_type != "text" else msg.text
     add_admin_file(label, file_type, file_id, caption)
-    clear_state(ADMIN_ID)
+    clear_state(admin_user_id)
     await update.message.reply_text(f"✅ فایل «{label}» به کتابخانه اضافه شد.", reply_markup=admin_library_menu())
     return True
 
@@ -8399,9 +8616,9 @@ async def handle_admin_broadcast_content_media(update, context):
     خروجی: True اگر پردازش شد، False در غیر این صورت.
     """
     admin_user_id = update.effective_user.id
-    if admin_user_id != ADMIN_ID:
+    if not is_admin(admin_user_id):
         return False
-    state, target_data = get_state(ADMIN_ID)
+    state, target_data = get_state(admin_user_id)
     if state != "adm_awaiting_broadcast_content":
         return False
 
@@ -8417,14 +8634,14 @@ async def handle_admin_broadcast_content_media(update, context):
     target_ids = parse_broadcast_target_ids(target_data)
     if not target_ids:
         await update.message.reply_text("❌ هیچ مقصدی برای ارسال پیدا نشد.", reply_markup=admin_panel_menu())
-        clear_state(ADMIN_ID)
+        clear_state(admin_user_id)
         return True
 
     caption = msg.caption
     import json
-    set_state(ADMIN_ID, "adm_broadcast_ready",
+    set_state(admin_user_id, "adm_broadcast_ready",
               json.dumps({"target_ids": target_ids, "file_type": file_type, "file_id": file_id, "caption": caption}))
-    await send_content_by_type(context, ADMIN_ID, file_type, file_id, caption)
+    await send_content_by_type(context, admin_user_id, file_type, file_id, caption)
     await update.message.reply_text(
         f"👆 پیش‌نمایش بالا. این محتوا به {len(target_ids)} کاربر ارسال خواهد شد. تأیید می‌کنید؟",
         reply_markup=InlineKeyboardMarkup([
@@ -8446,14 +8663,14 @@ async def handle_license_chat_content(update, context):
     state, data = get_state(sender_id)
     msg = update.message
 
-    if state == "admin_chat_active" and sender_id == ADMIN_ID:
+    if state == "admin_chat_active" and is_admin(sender_id):
         try:
             chat_id_str, target_user_id_str = data.split(":")
             chat_id = int(chat_id_str)
             target_user_id = int(target_user_id_str)
         except Exception:
             await update.message.reply_text("❌ خطای داخلی؛ لطفاً دوباره از پیام درخواست شروع کنید.")
-            clear_state(ADMIN_ID)
+            clear_state(sender_id)
             return True
 
         action_menu = license_chat_action_menu(chat_id)
@@ -8468,7 +8685,14 @@ async def handle_license_chat_content(update, context):
         return True
 
     if state == "user_chat_active":
-        sent = await relay_free_message(msg, context, ADMIN_ID, prefix=f"💬 پیام از کاربر (آیدی {sender_id}):\n")
+        # data به‌فرمت "chat_id:admin_id" است تا پیام کاربر دقیقاً به همان
+        # ادمینی که مکالمه را شروع کرده برسد، نه لزوماً مالک اصلی
+        try:
+            _chat_id_str, owning_admin_id_str = data.split(":")
+            owning_admin_id = int(owning_admin_id_str)
+        except Exception:
+            owning_admin_id = ADMIN_ID  # حالت قدیمی/خرابی داده -- به مالک اصلی برمی‌گردیم
+        sent = await relay_free_message(msg, context, owning_admin_id, prefix=f"💬 پیام از کاربر (آیدی {sender_id}):\n")
         if not sent:
             await update.message.reply_text("❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.")
         return True
@@ -8510,9 +8734,9 @@ async def handle_admin_music_audio(update, context):
     if handled:
         return
     admin_user_id = update.effective_user.id
-    if admin_user_id != ADMIN_ID:
+    if not is_admin(admin_user_id):
         return
-    state, data = get_state(ADMIN_ID)
+    state, data = get_state(admin_user_id)
     if state != "admin_awaiting_music_file":
         return
     if not update.message.audio:
@@ -8523,7 +8747,7 @@ async def handle_admin_music_audio(update, context):
     request_row = get_music_request(request_id)
     if not request_row:
         await update.message.reply_text("❌ این درخواست دیگر معتبر نیست.")
-        clear_state(ADMIN_ID)
+        clear_state(admin_user_id)
         return
 
     requester_user_id, query_text, fulfilled = request_row
@@ -8537,12 +8761,17 @@ async def handle_admin_music_audio(update, context):
         await update.message.reply_text(f"✅ آهنگ با موفقیت برای کاربر ارسال شد.")
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در ارسال آهنگ به کاربر: {e}")
-    clear_state(ADMIN_ID)
+    clear_state(admin_user_id)
 
 init_reminder_db()  # ← حذف ماژول یادآور = پاک کن این خط
 init_custom_indicator_db()  # ← حذف ماژول اندیکاتور شخصی = پاک کن این خط
 app = Application.builder().token(TOKEN).post_init(post_init).build()
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = get_bot_setting("help_text") or DEFAULT_HELP_TEXT
+    await update.message.reply_text(help_text[:4000])
+
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("help", help_command))  # ← حذف راهنما = پاک کن این خط
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document_dispatcher))
 app.add_handler(MessageHandler(filters.AUDIO, handle_admin_music_audio))
