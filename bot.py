@@ -21,7 +21,17 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 TOKEN = os.environ.get("TOKEN", "")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+# ADMIN_ID می‌تواند یک عدد تنها یا چند عدد جدا‌شده با کاما باشد (چند مالک اصلی)
+# مثال: ADMIN_ID=111111,222222
+_admin_id_raw = os.environ.get("ADMIN_ID", "0")
+PRIMARY_ADMIN_IDS = set()
+for _part in _admin_id_raw.split(","):
+    _part = _part.strip()
+    if _part.isdigit() or (_part.startswith("-") and _part[1:].isdigit()):
+        PRIMARY_ADMIN_IDS.add(int(_part))
+if not PRIMARY_ADMIN_IDS:
+    PRIMARY_ADMIN_IDS.add(0)
+ADMIN_ID = next(iter(PRIMARY_ADMIN_IDS))  # اولین مالک اصلی -- برای سازگاری با کد قدیمی که یک ADMIN_ID تکی انتظار دارد
 GOLD_API_KEY = "goldapi-d23da414dfdcbbe06a2e2ce8d28a095c-io"
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 
@@ -57,9 +67,13 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS capital_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, fulfilled INTEGER DEFAULT 0, created_at TEXT)''')  # ← حذف ماژول ربات مدیریت سرمایه = پاک کن این خط
-    c.execute('''CREATE TABLE IF NOT EXISTS user_admin_messages (
+    c.execute('''CREATE TABLE IF NOT EXISTS msg_chats (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, message_text TEXT, replied INTEGER DEFAULT 0, created_at TEXT)''')  # ← حذف فیچر پیام به ادمین = پاک کن این خط
+        user_id INTEGER, status TEXT DEFAULT 'pending', admin_id INTEGER, created_at TEXT)''')  # ← حذف فیچر پیام به ادمین = پاک کن این ۲ جدول
+    c.execute('''CREATE TABLE IF NOT EXISTS msg_chat_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER, user_id INTEGER, admin_id INTEGER,
+        direction TEXT, content_summary TEXT, created_at TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS bot_settings (
         key TEXT PRIMARY KEY, value TEXT)''')  # ← حذف اگه هیچ فیچری ازش استفاده نکرد = پاک کن این خط
     c.execute('''CREATE TABLE IF NOT EXISTS trial_requests (
@@ -76,6 +90,9 @@ def init_db():
         label TEXT, content TEXT, created_at TEXT)''')  # ← حذف کتابخانه متن ادمین = پاک کن این خط
     c.execute('''CREATE TABLE IF NOT EXISTS admins (
         user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT)''')  # ← حذف چندادمینی = پاک کن این خط
+    c.execute('''CREATE TABLE IF NOT EXISTS social_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT, url TEXT, created_at TEXT)''')  # ← حذف لینک‌های تبلیغاتی = پاک کن این خط
     for col_def in [
         "ALTER TABLE users ADD COLUMN daily_msg INTEGER DEFAULT 1",
         "ALTER TABLE users ADD COLUMN referral_code TEXT",
@@ -106,11 +123,12 @@ def get_user(user_id):
     conn.close()
     return row
 
-# ─── چندادمینی: ADMIN_ID (متغیر محیطی) همیشه «مالک اصلی» است و از ──
-# ─── طریق پنل قابل حذف نیست؛ ادمین‌های اضافه از جدول admins میان ──
+# ─── چندادمینی: PRIMARY_ADMIN_IDS (متغیر محیطی ADMIN_ID، می‌تواند چند ──
+# ─── نفر باشد) همیشه «مالک اصلی» است و از طریق پنل قابل حذف نیست؛ ──
+# ─── ادمین‌های اضافه از جدول admins میان ────────────────────────
 def is_admin(user_id):
-    """آیا این کاربر ادمین است؟ (مالک اصلی از ENV یا هر کسی که در جدول admins باشد)"""
-    if user_id == ADMIN_ID:
+    """آیا این کاربر ادمین است؟ (هر مالک اصلی از ENV یا هر کسی که در جدول admins باشد)"""
+    if user_id in PRIMARY_ADMIN_IDS:
         return True
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
@@ -120,8 +138,8 @@ def is_admin(user_id):
     return row is not None
 
 def is_primary_admin(user_id):
-    """فقط مالک اصلی (ADMIN_ID از متغیر محیطی) -- برای عملیات حساس مثل افزودن/حذف ادمین دیگر"""
-    return user_id == ADMIN_ID
+    """فقط مالک(های) اصلی (PRIMARY_ADMIN_IDS از متغیر محیطی) -- برای عملیات حساس مثل افزودن/حذف ادمین دیگر یا دسترسی به اطلاعات کاربران"""
+    return user_id in PRIMARY_ADMIN_IDS
 
 def add_admin(user_id, added_by):
     conn = sqlite3.connect("bot.db")
@@ -140,7 +158,7 @@ def remove_admin(user_id):
     conn.close()
 
 def get_all_extra_admins():
-    """لیست ادمین‌های اضافه‌شده (بدون مالک اصلی) -- برای نمایش در پنل"""
+    """لیست ادمین‌های اضافه‌شده (بدون هیچ‌کدام از مالکین اصلی) -- برای نمایش در پنل"""
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
     c.execute("SELECT user_id, added_at FROM admins ORDER BY added_at")
@@ -148,9 +166,35 @@ def get_all_extra_admins():
     conn.close()
     return rows
 
+# ─── لینک‌های تبلیغاتی/شبکه‌های اجتماعی (فقط مالکین اصلی مدیریت می‌کنند) ──
+def add_social_link(label, url):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO social_links (label, url, created_at) VALUES (?, ?, ?)",
+              (label, url, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    link_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return link_id
+
+def get_social_links():
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT id, label, url FROM social_links ORDER BY id")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def delete_social_link(link_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM social_links WHERE id=?", (link_id,))
+    conn.commit()
+    conn.close()
+
 def get_all_admin_ids():
-    """لیست همه‌ی آیدی‌های ادمین (مالک اصلی + همه‌ی ادمین‌های اضافه) -- برای اطلاع‌رسانی به همه"""
-    ids = {ADMIN_ID}
+    """لیست همه‌ی آیدی‌های ادمین (همه‌ی مالکین اصلی + همه‌ی ادمین‌های اضافه) -- برای اطلاع‌رسانی به همه"""
+    ids = set(PRIMARY_ADMIN_IDS)
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
     c.execute("SELECT user_id FROM admins")
@@ -652,21 +696,23 @@ def get_overdue_pending_license_chats(minutes=15):
     conn.close()
     return rows
 
-def get_next_round_robin_admin():
+def get_next_round_robin_admin(setting_key="license_round_robin_index"):
     """
     آیدی ادمین بعدی برای واگذاری خودکار -- به‌ترتیب و مساوی بین
     ادمین‌های اضافه‌شده (نه مالک اصلی) می‌چرخد. اگر هیچ ادمین اضافه‌ای
     وجود نداشته باشد، None برمی‌گرداند (یعنی جایی برای واگذاری نیست).
+    setting_key جدا برای هر صف (مثلاً چت لایسنس و پیام به ادمین) تا
+    نوبت‌دهی این دو مستقل از هم بماند.
     """
     extra_admins = get_all_extra_admins()
     if not extra_admins:
         return None
     extra_ids = [a[0] for a in extra_admins]
-    idx_str = get_bot_setting("license_round_robin_index")
+    idx_str = get_bot_setting(setting_key)
     idx = int(idx_str) if idx_str and idx_str.isdigit() else 0
     idx = idx % len(extra_ids)
     next_admin_id = extra_ids[idx]
-    set_bot_setting("license_round_robin_index", str((idx + 1) % len(extra_ids)))
+    set_bot_setting(setting_key, str((idx + 1) % len(extra_ids)))
     return next_admin_id
 
 # ─── کتابخانه‌ی فایل‌های آماده‌ی ادمین (حداکثر ۱۰ عدد) ────────────
@@ -985,14 +1031,15 @@ async def handle_financial(query, user_id, context):
     elif data == "cap_paid_confirm":
         requester = query.from_user
         chat_id = create_license_chat(user_id)
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                license_request_text(requester.first_name, requester.username, user_id),
-                reply_markup=license_request_primary_menu(chat_id)
-            )
-        except Exception as e:
-            print(f"خطای اطلاع‌رسانی درخواست لایسنس به مالک اصلی: {e}")
+        for primary_id in PRIMARY_ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    primary_id,
+                    license_request_text(requester.first_name, requester.username, user_id),
+                    reply_markup=license_request_primary_menu(chat_id)
+                )
+            except Exception as e:
+                print(f"خطای اطلاع‌رسانی درخواست لایسنس به مالک اصلی {primary_id}: {e}")
         await query.edit_message_text(
             "✅ درخواست شما برای ادمین ارسال شد؛ به‌زودی مکالمه شروع می‌شود.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="back_financial")]])
@@ -3167,41 +3214,99 @@ def toggle_email_alerts(user_id, enabled):
     conn.commit()
     conn.close()
 
-# ─── پیام محدود کاربر به ادمین (حداکثر ۳ پیام در ۲۴ ساعت) ──────
-def get_user_message_count_24h(user_id):
-    """تعداد پیام‌هایی که این کاربر در ۲۴ ساعت گذشته به ادمین فرستاده"""
+# ─── پیام محدود کاربر به ادمین (حداکثر ۳ چت جدید در ۲۴ ساعت) -────
+# ─── دقیقاً با همون الگوی چت لایسنس: اول مالکین اصلی، امکان انتقال ──
+# ─── دستی، و واگذاری خودکار بعد از ۱۵ دقیقه بین ادمین‌های اضافه ────
+def get_user_new_chat_count_24h(user_id):
+    """تعداد چت‌های جدیدی که این کاربر در ۲۴ ساعت گذشته با ادمین شروع کرده (نه هر پیام داخل یک چت فعال)"""
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
     cutoff = (get_iran_now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
-    c.execute("SELECT COUNT(*) FROM user_admin_messages WHERE user_id=? AND created_at >= ?", (user_id, cutoff))
+    c.execute("SELECT COUNT(*) FROM msg_chats WHERE user_id=? AND created_at >= ?", (user_id, cutoff))
     count = c.fetchone()[0]
     conn.close()
     return count
 
-def save_user_admin_message(user_id, text):
+def create_msg_chat(user_id):
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("INSERT INTO user_admin_messages (user_id, message_text, created_at) VALUES (?, ?, ?)",
-              (user_id, text, get_iran_now().strftime("%Y-%m-%d %H:%M")))
-    message_id = c.lastrowid
+    c.execute("INSERT INTO msg_chats (user_id, status, admin_id, created_at) VALUES (?, 'pending', ?, ?)",
+              (user_id, ADMIN_ID, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    chat_id = c.lastrowid
     conn.commit()
     conn.close()
-    return message_id
+    return chat_id
 
-def get_user_admin_message(message_id):
+def get_msg_chat(chat_id):
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("SELECT user_id, message_text, replied FROM user_admin_messages WHERE id=?", (message_id,))
+    c.execute("SELECT user_id, status, admin_id FROM msg_chats WHERE id=?", (chat_id,))
     row = c.fetchone()
     conn.close()
     return row
 
-def mark_user_admin_message_replied(message_id):
+def update_msg_chat_status(chat_id, status):
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("UPDATE user_admin_messages SET replied=1 WHERE id=?", (message_id,))
+    c.execute("UPDATE msg_chats SET status=? WHERE id=?", (status, chat_id))
     conn.commit()
     conn.close()
+
+def assign_msg_chat_admin(chat_id, admin_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("UPDATE msg_chats SET admin_id=? WHERE id=?", (admin_id, chat_id))
+    conn.commit()
+    conn.close()
+
+def get_overdue_pending_msg_chats(minutes=15):
+    """چت‌های پشتیبانی که هنوز 'pending' مانده، دست مالک اصلی است (منتقل نشده)، و بیش از {minutes} دقیقه گذشته"""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    cutoff = (get_iran_now() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M")
+    c.execute("SELECT id, user_id FROM msg_chats WHERE status='pending' AND admin_id=? AND created_at<=?",
+              (ADMIN_ID, cutoff))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def log_msg_chat_message(chat_id, user_id, admin_id, direction, content_summary):
+    """ثبت هر پیام رد‌و‌بدل‌شده (هر دو جهت) برای گزارش اکسل بعدی؛ فقط ۱۰ روز اخیر نگه داشته می‌شود"""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute('''INSERT INTO msg_chat_logs (chat_id, user_id, admin_id, direction, content_summary, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (chat_id, user_id, admin_id, direction, content_summary, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    conn.close()
+
+def purge_old_msg_chat_logs(days=10):
+    """حذف خودکار لاگ گفتگوهای پشتیبانی قدیمی‌تر از {days} روز -- طبق درخواست کاربر"""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    cutoff = (get_iran_now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    c.execute("DELETE FROM msg_chat_logs WHERE created_at < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+def get_msg_chat_logs():
+    """همه‌ی ردیف‌های لاگ باقی‌مانده (همیشه حداکثر ۱۰ روز اخیر، چون قدیمی‌تر خودکار پاک می‌شود)"""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT created_at, user_id, admin_id, direction, content_summary FROM msg_chat_logs ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_msg_chat_original_text(chat_id):
+    """متن اولین پیامی که کاربر برای شروع این گفتگو فرستاده -- برای نمایش دوباره هنگام انتقال/انصراف انتقال"""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute('''SELECT content_summary FROM msg_chat_logs WHERE chat_id=? AND direction='user_to_admin'
+                 ORDER BY id ASC LIMIT 1''', (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else "(متن اصلی در دسترس نیست)"
 
 def settings_menu():
     return InlineKeyboardMarkup([
@@ -3209,6 +3314,7 @@ def settings_menu():
          InlineKeyboardButton("✏️ تکمیل پروفایل", callback_data="set_complete_profile")],
         [InlineKeyboardButton("📅 تاریخ انقضا", callback_data="set_expiry"),
          InlineKeyboardButton("📩 پیام به ادمین", callback_data="set_msg_admin")],  # ← حذف فیچر پیام به ادمین = پاک کن این خط
+        [InlineKeyboardButton("📢 صفحات و شبکه‌های ما", callback_data="menu_social_links")],  # ← حذف لینک‌های تبلیغاتی = پاک کن این خط
         [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
     ])
 
@@ -3228,6 +3334,18 @@ async def handle_settings(query, user_id, context):
     data = query.data
     if data == "menu_settings":
         await query.edit_message_text("⚙️ تنظیمات:", reply_markup=settings_menu())
+
+    elif data == "menu_social_links":  # ← حذف لینک‌های تبلیغاتی = پاک کن این بلوک
+        links = get_social_links()
+        if not links:
+            await query.edit_message_text(
+                "📢 هنوز لینکی ثبت نشده.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="menu_settings")]])
+            )
+            return
+        rows = [[InlineKeyboardButton(label, url=url)] for _id, label, url in links]
+        rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="menu_settings")])
+        await query.edit_message_text("📢 صفحات و شبکه‌های ما:", reply_markup=InlineKeyboardMarkup(rows))
 
     elif data == "set_profile":
         db_user = get_user(user_id)
@@ -3282,7 +3400,7 @@ async def handle_settings(query, user_id, context):
         )
 
     elif data == "set_msg_admin":  # ← حذف فیچر پیام به ادمین = پاک کن این بلوک elif
-        msg_count = get_user_message_count_24h(user_id)
+        msg_count = get_user_new_chat_count_24h(user_id)
         if msg_count >= 3:
             await query.answer(
                 "⛔ شما در ۲۴ ساعت گذشته به حداکثر تعداد پیام (۳ عدد) رسیده‌اید. لطفاً بعداً دوباره امتحان کنید.",
@@ -3404,7 +3522,7 @@ async def handle_settings_message(user_id, text, update, context):
         return True
 
     elif state == "set_awaiting_admin_msg":  # ← حذف فیچر پیام به ادمین = پاک کن این بلوک elif
-        msg_count = get_user_message_count_24h(user_id)
+        msg_count = get_user_new_chat_count_24h(user_id)
         if msg_count >= 3:
             clear_state(user_id)
             await update.message.reply_text(
@@ -3414,18 +3532,18 @@ async def handle_settings_message(user_id, text, update, context):
             return True
         message_text = text.strip()
         clear_state(user_id)
-        message_id = save_user_admin_message(user_id, message_text)
+        chat_id = create_msg_chat(user_id)
+        log_msg_chat_message(chat_id, user_id, None, "user_to_admin", message_text)
         requester = update.effective_user
-        await notify_admins(
-            context.bot,
-            f"📩 پیام جدید از کاربر\n\n"
-            f"👤 از طرف: {requester.first_name} (@{requester.username or 'ندارد'})\n"
-            f"🆔 آیدی: {user_id}\n\n"
-            f"💬 متن پیام:\n{message_text}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↩️ پاسخ بده", callback_data=f"admin_reply_msg_{message_id}")]
-            ])
-        )
+        for primary_id in PRIMARY_ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    primary_id,
+                    msg_request_text(requester.first_name, requester.username, user_id, message_text),
+                    reply_markup=msg_request_primary_menu(chat_id)
+                )
+            except Exception as e:
+                print(f"خطای اطلاع‌رسانی پیام کاربر به مالک اصلی {primary_id}: {e}")
         await update.message.reply_text(
             "✅ پیام شما ارسال شد؛ ادمین به‌زودی پاسخ می‌دهد.",
             reply_markup=settings_menu()
@@ -3650,6 +3768,36 @@ def admin_generate_users_excel():
     buffer.seek(0)
     return buffer
 
+def generate_msg_chat_logs_excel():
+    """
+    ساخت فایل اکسل از لاگ گفتگوهای «پیام به ادمین» -- همیشه فقط شامل
+    ۱۰ روز اخیر است (چون قدیمی‌تر خودکار توسط msg_chat_escalation_loop
+    پاک می‌شود). ستون‌ها مشخص می‌کنند کدام ادمین به کدام کاربر پاسخ داده.
+    """
+    rows = get_msg_chat_logs()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "گفتگوهای پشتیبانی (۱۰ روز اخیر)"
+    headers = ["زمان", "آیدی کاربر", "آیدی ادمین", "جهت", "متن/نوع پیام"]
+    direction_fa = {"user_to_admin": "کاربر → ادمین", "admin_to_user": "ادمین → کاربر"}
+    ws.append(headers)
+    for col in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        cell.alignment = Alignment(horizontal="center")
+    for created_at, user_id, admin_id, direction, content_summary in rows:
+        ws.append([created_at, user_id, admin_id or "---", direction_fa.get(direction, direction), content_summary])
+    for col_cells in ws.columns:
+        length = max((len(str(cell.value)) if cell.value else 0) for cell in col_cells)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 10), 50)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
 def admin_get_all_active_user_ids():
     """دریافت آیدی همه‌ی کاربران فعال (بدون محدودیت تعداد) برای ارسال پیام همگانی"""
     conn = sqlite3.connect("bot.db")
@@ -3709,19 +3857,29 @@ def admin_get_failed_requests(limit=20):
 JOIN_METHOD_LABELS = {"admin": "تأیید ادمین", "referral": "دعوت", "paid": "پرداخت", None: "نامشخص"}
 STATUS_LABELS = {"active": "✅ فعال", "pending": "⏳ در انتظار", "rejected": "❌ رد شده"}
 
-def admin_panel_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 آمار کلی", callback_data="adm_stats"),
-         InlineKeyboardButton("👥 لیست کاربران", callback_data="adm_users")],
-        [InlineKeyboardButton("📥 خروجی اکسل کاربران", callback_data="adm_export_users"),  # ← حذف = پاک کن این خط
-         InlineKeyboardButton("📝 لاگ درخواست‌های ناموفق", callback_data="adm_failed")],
-        [InlineKeyboardButton("📢 ارسال پیام به کاربران", callback_data="adm_broadcast_menu")],
-        [InlineKeyboardButton("📶 لیست اندیکاتورهای شخصی ارسالی", callback_data="adm_indicators")],
-        [InlineKeyboardButton("📁 کتابخانه‌ی فایل و متن", callback_data="adm_library")],  # ← حذف کتابخانه = پاک کن این خط
-        [InlineKeyboardButton("🔎 مدیریت سریع یک کاربر (با آیدی)", callback_data="adm_manage_user")],
-        [InlineKeyboardButton("👥 مدیریت ادمین‌ها", callback_data="adm_manage_admins")],  # ← حذف چندادمینی = پاک کن این خط
-        [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
-    ])
+def admin_panel_menu(user_id):
+    """
+    منوی پنل مدیریت بر اساس سطح دسترسی متفاوت است: مالکین اصلی همه‌ی
+    بخش‌ها را می‌بینند؛ ادمین‌های اضافه‌شده به اطلاعات کاربران (لیست/
+    اکسل/مدیریت سریع)، پیام همگانی، و مدیریت ادمین‌ها دسترسی ندارند.
+    """
+    rows = [[InlineKeyboardButton("📊 آمار کلی", callback_data="adm_stats")]]
+    if is_primary_admin(user_id):
+        rows[0].append(InlineKeyboardButton("👥 لیست کاربران", callback_data="adm_users"))
+        rows.append([InlineKeyboardButton("📥 خروجی اکسل کاربران", callback_data="adm_export_users"),  # ← حذف = پاک کن این خط
+                     InlineKeyboardButton("📝 لاگ درخواست‌های ناموفق", callback_data="adm_failed")])
+        rows.append([InlineKeyboardButton("📢 ارسال پیام به کاربران", callback_data="adm_broadcast_menu")])
+    else:
+        rows.append([InlineKeyboardButton("📝 لاگ درخواست‌های ناموفق", callback_data="adm_failed")])
+    rows.append([InlineKeyboardButton("📶 لیست اندیکاتورهای شخصی ارسالی", callback_data="adm_indicators")])
+    rows.append([InlineKeyboardButton("📁 کتابخانه‌ی فایل و متن", callback_data="adm_library")])  # ← حذف کتابخانه = پاک کن این خط
+    if is_primary_admin(user_id):
+        rows.append([InlineKeyboardButton("🔎 مدیریت سریع یک کاربر (با آیدی)", callback_data="adm_manage_user")])
+        rows.append([InlineKeyboardButton("👥 مدیریت ادمین‌ها", callback_data="adm_manage_admins")])  # ← حذف چندادمینی = پاک کن این خط
+        rows.append([InlineKeyboardButton("🔗 لینک‌های تبلیغاتی", callback_data="adm_social_links")])  # ← حذف لینک‌های تبلیغاتی = پاک کن این خط
+        rows.append([InlineKeyboardButton("📥 اکسل گفتگوهای پشتیبانی (۱۰ روز)", callback_data="adm_export_msg_logs")])  # ← حذف فیچر پیام به ادمین = پاک کن این خط
+    rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
 
 def admin_manage_admins_menu():
     extra_admins = get_all_extra_admins()
@@ -3794,6 +3952,33 @@ def license_request_text(requester_first_name, requester_username, user_id):
         f"کانال‌های دیگر) با این کاربر، دکمه‌ی زیر را بزنید."
     )
 
+def msg_chat_action_menu(chat_id):
+    """در حین چت فعال «پیام به ادمین» -- فقط پایان مکالمه (برخلاف چت لایسنس، دکمه‌ی سریع فایل/متن ندارد)"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔚 پایان مکالمه", callback_data=f"msgc_end_{chat_id}")],
+    ])
+
+def msg_request_primary_menu(chat_id):
+    """پیامی که فقط مالکین اصلی می‌بینند -- هم می‌توانند خودشان پاسخ بدهند، هم منتقل کنند"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ پاسخ بده", callback_data=f"msgc_start_{chat_id}")],
+        [InlineKeyboardButton("↪️ انتقال به ادمین دیگر", callback_data=f"msgc_transfer_pick_{chat_id}")],
+    ])
+
+def msg_request_assigned_menu(chat_id):
+    """پیامی که به ادمینی که این گفتگو به او منتقل/واگذار شده می‌رسد -- فقط پاسخ، بدون انتقال بیشتر"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ پاسخ بده", callback_data=f"msgc_start_{chat_id}")],
+    ])
+
+def msg_request_text(requester_first_name, requester_username, user_id, message_text):
+    return (
+        f"📩 پیام جدید از کاربر\n\n"
+        f"👤 از طرف: {requester_first_name} (@{requester_username or 'ندارد'})\n"
+        f"🆔 آیدی: {user_id}\n\n"
+        f"💬 متن پیام:\n{message_text}"
+    )
+
 async def handle_admin_panel(query, user_id, context):
     if not is_admin(user_id):
         await query.answer("⛔ این بخش فقط برای ادمین است.", show_alert=True)
@@ -3801,8 +3986,16 @@ async def handle_admin_panel(query, user_id, context):
 
     data = query.data
 
+    # ─── دفاع در عمق: علاوه بر مخفی بودن این دکمه‌ها در منو برای ادمین‌های
+    # اضافه، اگر کسی مستقیم callback_data را بزند هم همینجا رد می‌شود ───
+    _primary_only_prefixes = ("adm_users", "adm_export_users", "adm_manage_user", "adm_block_",
+                               "adm_activate_", "adm_broadcast_", "adm_social_link", "adm_export_msg_logs")
+    if data.startswith(_primary_only_prefixes) and not is_primary_admin(user_id):
+        await query.answer("⛔ این بخش فقط برای مالک اصلی ربات است.", show_alert=True)
+        return
+
     if data == "admin_panel":
-        await query.edit_message_text("🛠 پنل مدیریت:", reply_markup=admin_panel_menu())
+        await query.edit_message_text("🛠 پنل مدیریت:", reply_markup=admin_panel_menu(user_id))
 
     elif data == "adm_broadcast_menu":
         await query.edit_message_text(
@@ -3941,7 +4134,7 @@ async def handle_admin_panel(query, user_id, context):
         clear_state(user_id)
         await query.message.reply_text(
             f"✅ ارسال تمام شد.\n\n📤 موفق: {success_count} | ❌ ناموفق: {fail_count}",
-            reply_markup=admin_panel_menu()
+            reply_markup=admin_panel_menu(user_id)
         )
 
     elif data == "adm_stats":
@@ -3954,12 +4147,12 @@ async def handle_admin_panel(query, user_id, context):
             f"❌ رد شده: {stats['rejected']}\n"
             f"🆕 تأییدشده امروز: {stats['approved_today']}"
         )
-        await query.edit_message_text(text, reply_markup=admin_panel_menu())
+        await query.edit_message_text(text, reply_markup=admin_panel_menu(user_id))
 
     elif data == "adm_users":
         users = admin_get_all_users()
         if not users:
-            await query.edit_message_text("📭 هنوز کاربری ثبت نشده.", reply_markup=admin_panel_menu())
+            await query.edit_message_text("📭 هنوز کاربری ثبت نشده.", reply_markup=admin_panel_menu(user_id))
             return
         lines = []
         for uid, first_name, username, status, approved_at, join_method, email, phone, birthdate, city, country, occupation in users:
@@ -3992,9 +4185,9 @@ async def handle_admin_panel(query, user_id, context):
             await query.edit_message_text(chunks[0])
             for chunk in chunks[1:]:
                 await query.message.reply_text(chunk)
-            await query.message.reply_text("👆 لیست کاربران", reply_markup=admin_panel_menu())
+            await query.message.reply_text("👆 لیست کاربران", reply_markup=admin_panel_menu(user_id))
         else:
-            await query.edit_message_text(text, reply_markup=admin_panel_menu())
+            await query.edit_message_text(text, reply_markup=admin_panel_menu(user_id))
 
     elif data == "adm_export_users":  # ← حذف = پاک کن این خط
         await query.answer("⏳ در حال ساخت فایل اکسل...")
@@ -4005,12 +4198,27 @@ async def handle_admin_panel(query, user_id, context):
             filename=f"users_{get_iran_now().strftime('%Y-%m-%d_%H-%M')}.xlsx",
             caption="📊 خروجی اکسل کامل لیست کاربران (همه‌ی فیلدهای پروفایل)"
         )
-        await query.message.reply_text("👆 فایل اکسل ارسال شد.", reply_markup=admin_panel_menu())
+        await query.message.reply_text("👆 فایل اکسل ارسال شد.", reply_markup=admin_panel_menu(user_id))
+
+    elif data == "adm_export_msg_logs":  # ← حذف فیچر پیام به ادمین = پاک کن این بلوک
+        await query.answer("⏳ در حال ساخت فایل اکسل...")
+        rows = get_msg_chat_logs()
+        if not rows:
+            await query.edit_message_text("📭 در ۱۰ روز اخیر هیچ گفتگویی ثبت نشده.", reply_markup=admin_panel_menu(user_id))
+            return
+        buffer = generate_msg_chat_logs_excel()
+        await context.bot.send_document(
+            user_id,
+            document=buffer,
+            filename=f"support_chats_{get_iran_now().strftime('%Y-%m-%d_%H-%M')}.xlsx",
+            caption="📊 گفتگوهای «پیام به ادمین» -- ۱۰ روز اخیر (قدیمی‌تر خودکار پاک می‌شود)"
+        )
+        await query.message.reply_text("👆 فایل اکسل ارسال شد.", reply_markup=admin_panel_menu(user_id))
 
     elif data == "adm_indicators":
         indicators = admin_get_all_custom_indicators()
         if not indicators:
-            await query.edit_message_text("📭 هنوز هیچ اندیکاتور شخصی ارسال نشده.", reply_markup=admin_panel_menu())
+            await query.edit_message_text("📭 هنوز هیچ اندیکاتور شخصی ارسال نشده.", reply_markup=admin_panel_menu(user_id))
             return
         keyboard = []
         for ind_id, first_name, uid, name, source, created_at in indicators:
@@ -4034,12 +4242,12 @@ async def handle_admin_panel(query, user_id, context):
     elif data == "adm_failed":
         failed = admin_get_failed_requests()
         if not failed:
-            await query.edit_message_text("📭 هیچ درخواست ناموفقی ثبت نشده.", reply_markup=admin_panel_menu())
+            await query.edit_message_text("📭 هیچ درخواست ناموفقی ثبت نشده.", reply_markup=admin_panel_menu(user_id))
             return
         lines = [f"🔸 [{module}] «{query_text}» -- {first_name or 'نامشخص'} -- {format_date_fa(created_at)}"
                  for module, query_text, created_at, first_name in failed]
         text = "📝 آخرین درخواست‌های ناموفق:\n\n" + "\n".join(lines)
-        await query.edit_message_text(text[:4000], reply_markup=admin_panel_menu())
+        await query.edit_message_text(text[:4000], reply_markup=admin_panel_menu(user_id))
 
     elif data == "adm_library":  # ← حذف کتابخانه = پاک کن این بلوک
         await query.edit_message_text("📁 کتابخانه‌ی فایل و متن:", reply_markup=admin_library_menu())
@@ -4253,6 +4461,35 @@ async def handle_admin_panel(query, user_id, context):
             print(f"خطای اطلاع‌رسانی لغو دسترسی ادمین: {e}")
         await query.edit_message_text("✅ حذف شد.", reply_markup=admin_manage_admins_menu())
 
+    elif data == "adm_social_links":  # ← حذف لینک‌های تبلیغاتی = پاک کن این ۳ بلوک elif
+        links = get_social_links()
+        rows = [[InlineKeyboardButton(f"🗑 {label}", callback_data=f"adm_social_link_del_{lid}")]
+                for lid, label, url in links]
+        rows.append([InlineKeyboardButton("➕ افزودن لینک جدید", callback_data="adm_social_link_add")])
+        rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")])
+        await query.edit_message_text(
+            f"🔗 لینک‌های تبلیغاتی (تعداد: {len(links)})\n\n"
+            f"این لینک‌ها زیر ⚙️ تنظیمات → 📢 صفحات و شبکه‌های ما به همه‌ی کاربران نشان داده می‌شود.",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+
+    elif data == "adm_social_link_add":
+        set_state(user_id, "adm_awaiting_social_link_label")
+        await query.edit_message_text(
+            "اسمی که کاربر می‌بیند را بنویسید (مثلاً «📸 اینستاگرام» یا «📢 کانال تلگرام»):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="adm_social_links")]])
+        )
+
+    elif data.startswith("adm_social_link_del_"):
+        link_id = int(data.replace("adm_social_link_del_", ""))
+        delete_social_link(link_id)
+        links = get_social_links()
+        rows = [[InlineKeyboardButton(f"🗑 {label}", callback_data=f"adm_social_link_del_{lid}")]
+                for lid, label, url in links]
+        rows.append([InlineKeyboardButton("➕ افزودن لینک جدید", callback_data="adm_social_link_add")])
+        rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")])
+        await query.edit_message_text(f"✅ حذف شد.\n\n🔗 لینک‌های تبلیغاتی (تعداد: {len(links)})", reply_markup=InlineKeyboardMarkup(rows))
+
     elif data.startswith("adm_block_") or data.startswith("adm_activate_"):
         target_uid = int(data.split("_")[-1])
         is_activate = data.startswith("adm_activate_")
@@ -4263,7 +4500,7 @@ async def handle_admin_panel(query, user_id, context):
         status_label = "✅ فعال" if is_activate else "❌ رد شده"
         await query.edit_message_text(
             f"✅ وضعیت کاربر {target_uid} به «{status_label}» تغییر کرد.",
-            reply_markup=admin_panel_menu()
+            reply_markup=admin_panel_menu(user_id)
         )
         try:
             if is_activate:
@@ -4283,7 +4520,7 @@ async def handle_admin_panel_message(user_id, text, update):
         message_text = text
         target_ids = parse_broadcast_target_ids(data)
         if not target_ids:
-            await update.message.reply_text("❌ هیچ مقصدی برای ارسال پیدا نشد.", reply_markup=admin_panel_menu())
+            await update.message.reply_text("❌ هیچ مقصدی برای ارسال پیدا نشد.", reply_markup=admin_panel_menu(user_id))
             clear_state(user_id)
             return True
         import json
@@ -4379,6 +4616,29 @@ async def handle_admin_panel_message(user_id, text, update):
         )
         return True
 
+    elif state == "adm_awaiting_social_link_label":  # ← حذف لینک‌های تبلیغاتی = پاک کن این ۲ بلوک elif
+        if not is_primary_admin(user_id):
+            clear_state(user_id)
+            return True
+        label = text.strip()[:60]
+        set_state(user_id, "adm_awaiting_social_link_url", label)
+        await update.message.reply_text(f"حالا آدرس (لینک) «{label}» را بفرستید (باید با http:// یا https:// شروع شود):")
+        return True
+
+    elif state == "adm_awaiting_social_link_url":
+        if not is_primary_admin(user_id):
+            clear_state(user_id)
+            return True
+        url = text.strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await update.message.reply_text("❌ لینک باید با http:// یا https:// شروع شود. دوباره بفرستید:")
+            return True
+        label = data
+        add_social_link(label, url)
+        clear_state(user_id)
+        await update.message.reply_text(f"✅ لینک «{label}» اضافه شد.", reply_markup=admin_panel_menu(user_id))
+        return True
+
     elif state == "adm_awaiting_new_file_label":  # ← حذف کتابخانه = پاک کن این ۴ بلوک elif
         label = text.strip()[:60]
         set_state(user_id, "adm_awaiting_new_file_content", label)
@@ -4428,7 +4688,7 @@ async def handle_admin_panel_message(user_id, text, update):
         target = get_user(target_uid)
         clear_state(user_id)
         if not target:
-            await update.message.reply_text("❌ کاربری با این آیدی پیدا نشد.", reply_markup=admin_panel_menu())
+            await update.message.reply_text("❌ کاربری با این آیدی پیدا نشد.", reply_markup=admin_panel_menu(user_id))
             return True
         status_label = STATUS_LABELS.get(target[3], target[3])
         method_label = JOIN_METHOD_LABELS.get(target[10] if len(target) > 10 else None, "نامشخص")
@@ -7993,6 +8253,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_referral_code(user.id)
     clear_state(user.id)
 
+    # ─── ادمین‌ها (مالک اصلی یا اضافه‌شده از پنل) هیچ‌وقت نیازی به تأیید ندارند ───
+    just_auto_approved_admin = False
+    if is_admin(user.id):
+        db_user_check = get_user(user.id)
+        if db_user_check and db_user_check[3] != 'active':
+            approve_user(user.id)
+            just_auto_approved_admin = True
+
     # ─── اطلاع‌رسانی فقط برای ورود اول (عضویت جدید) به ادمین ───
     if not is_admin(user.id) and was_new_user:
         await notify_admins(
@@ -8044,7 +8312,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⏳ {user.first_name} عزیز،\nاشتراک شما منقضی شده.")
             await notify_admins(context.bot, f"🔄 منقضی:\n👤 {user.first_name}\n🆔 {user.id}")
             return
-        if prior_state == "first_active_start_pending":
+        if prior_state == "first_active_start_pending" or just_auto_approved_admin:
             await update.message.reply_text(
                 f"✅ {user.first_name} عزیز، خوش آمدید! 🎉\n\n"
                 f"این چند بخش اصلی ربات هستند:\n\n"
@@ -8210,20 +8478,117 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_state(user_id)
         await query.edit_message_text(f"✅ ارسال برای این کاربر تمام شد (درخواست #{request_id}).")
 
-    elif data.startswith("admin_reply_msg_"):  # ← حذف فیچر پیام به ادمین = پاک کن این بلوک
+    elif data.startswith("msgc_start_"):  # ← حذف فیچر پیام به ادمین = پاک کن این ۵ بلوک elif
         if not is_admin(user_id):
             await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
             return
-        message_id = int(data.replace("admin_reply_msg_", ""))
-        msg_row = get_user_admin_message(message_id)
-        if not msg_row:
+        chat_id = int(data.replace("msgc_start_", ""))
+        chat_row = get_msg_chat(chat_id)
+        if not chat_row:
             await query.answer("این پیام پیدا نشد.", show_alert=True)
             return
-        target_user_id, message_text, replied = msg_row
-        set_state(user_id, "admin_awaiting_reply_content", f"{message_id}:{target_user_id}")
+        target_user_id, status, _existing_admin_id = chat_row
+        if status == "closed":
+            await query.answer("این گفتگو قبلاً بسته شده.", show_alert=True)
+            return
+        update_msg_chat_status(chat_id, "active")
+        assign_msg_chat_admin(chat_id, user_id)
+        set_state(user_id, "admin_msg_chat_active", f"{chat_id}:{target_user_id}")
+        set_state(target_user_id, "user_msg_chat_active", f"{chat_id}:{user_id}")
+        try:
+            await context.bot.send_message(
+                target_user_id,
+                "✅ ادمین به پیام شما پاسخ داد؛ از همین‌جا می‌توانید ادامه بدهید (متن، عکس، فایل، صدا یا ویدیو)."
+            )
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی شروع پاسخ به کاربر: {e}")
         await query.edit_message_text(
-            "📤 متن، عکس، فایل، صدا یا ویدیوی پاسخ را همین‌جا بفرستید تا خودکار برای کاربر ارسال شود."
+            "✅ گفتگو باز شد. از همین‌جا هرچه بفرستید مستقیم برای کاربر می‌رود.",
+            reply_markup=msg_chat_action_menu(chat_id)
         )
+
+    elif data.startswith("msgc_transfer_pick_"):
+        if not is_primary_admin(user_id):
+            await query.answer("⛔ فقط مالک اصلی می‌تواند گفتگو را منتقل کند.", show_alert=True)
+            return
+        chat_id = int(data.replace("msgc_transfer_pick_", ""))
+        chat_row = get_msg_chat(chat_id)
+        if not chat_row or chat_row[1] == "closed":
+            await query.answer("این گفتگو دیگر معتبر نیست.", show_alert=True)
+            return
+        extra_admins = get_all_extra_admins()
+        if not extra_admins:
+            await query.answer("هنوز هیچ ادمین اضافه‌ای تعریف نکرده‌اید (پنل مدیریت → مدیریت ادمین‌ها).", show_alert=True)
+            return
+        rows = [[InlineKeyboardButton(f"👤 {aid}", callback_data=f"msgc_transfer_to_{chat_id}_{aid}")]
+                for aid, _added_at in extra_admins]
+        rows.append([InlineKeyboardButton("🔙 انصراف", callback_data=f"msgc_cancel_transfer_{chat_id}")])
+        await query.edit_message_text("↪️ این پیام به کدام ادمین منتقل شود؟", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data.startswith("msgc_transfer_to_"):
+        if not is_primary_admin(user_id):
+            await query.answer("⛔ فقط مالک اصلی می‌تواند گفتگو را منتقل کند.", show_alert=True)
+            return
+        remainder = data.replace("msgc_transfer_to_", "")
+        chat_id_str, target_admin_id_str = remainder.split("_")
+        chat_id, target_admin_id = int(chat_id_str), int(target_admin_id_str)
+        chat_row = get_msg_chat(chat_id)
+        if not chat_row or chat_row[1] == "closed":
+            await query.answer("این گفتگو دیگر معتبر نیست.", show_alert=True)
+            return
+        target_user_id = chat_row[0]
+        original_text = get_msg_chat_original_text(chat_id)
+        assign_msg_chat_admin(chat_id, target_admin_id)
+        try:
+            requester_target = await context.bot.get_chat(target_user_id)
+            await context.bot.send_message(
+                target_admin_id,
+                msg_request_text(requester_target.first_name or "کاربر", requester_target.username, target_user_id, original_text),
+                reply_markup=msg_request_assigned_menu(chat_id)
+            )
+        except Exception as e:
+            print(f"خطای ارسال پیام منتقل‌شده به ادمین {target_admin_id}: {e}")
+        await query.edit_message_text(f"✅ پیام به ادمین {target_admin_id} منتقل شد.")
+
+    elif data.startswith("msgc_cancel_transfer_"):
+        chat_id = int(data.replace("msgc_cancel_transfer_", ""))
+        chat_row = get_msg_chat(chat_id)
+        if not chat_row:
+            await query.answer("این پیام پیدا نشد.", show_alert=True)
+            return
+        target_user_id, status, _admin_id = chat_row
+        original_text = get_msg_chat_original_text(chat_id)
+        try:
+            requester_target = await context.bot.get_chat(target_user_id)
+            req_name, req_username = requester_target.first_name or "کاربر", requester_target.username
+        except Exception:
+            req_name, req_username = "کاربر", None
+        await query.edit_message_text(
+            msg_request_text(req_name, req_username, target_user_id, original_text),
+            reply_markup=msg_request_primary_menu(chat_id)
+        )
+
+    elif data.startswith("msgc_end_"):
+        if not is_admin(user_id):
+            await query.answer("⛔ این دکمه فقط برای ادمین است.", show_alert=True)
+            return
+        chat_id = int(data.replace("msgc_end_", ""))
+        chat_row = get_msg_chat(chat_id)
+        if not chat_row:
+            await query.answer("این گفتگو پیدا نشد.", show_alert=True)
+            return
+        target_user_id, status, chat_admin_id = chat_row
+        update_msg_chat_status(chat_id, "closed")
+        clear_state(chat_admin_id or user_id)
+        clear_state(target_user_id)
+        await query.edit_message_text("✅ گفتگو بسته شد.")
+        try:
+            await context.bot.send_message(
+                target_user_id,
+                "🔒 گفتگو با ادمین بسته شد. در صورت نیاز دوباره از ⚙️ تنظیمات → 📩 پیام به ادمین اقدام کنید."
+            )
+        except Exception as e:
+            print(f"خطای اطلاع‌رسانی پایان گفتگو به کاربر: {e}")
 
     elif data.startswith("lic_start_"):  # ← حذف فیچر چت لایسنس = پاک کن این بلوک
         if not is_admin(user_id):
@@ -8458,7 +8823,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_tools":
         await handle_tools(query, user_id)  # ← حذف ماژول ابزارهای کاربردی = پاک کن این خط
 
-    elif data.startswith("menu_settings") or data.startswith("set_"):
+    elif data.startswith("menu_settings") or data.startswith("set_") or data == "menu_social_links":
         await handle_settings(query, user_id, context)  # ← حذف ماژول = پاک کن این خط
 
     elif data == "menu_help":  # ← حذف راهنما = پاک کن این بلوک
@@ -8488,9 +8853,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = text_raw
     state, _ = get_state(user_id)
 
-    if state in ("admin_awaiting_capital_content", "admin_awaiting_reply_content", "adm_awaiting_trial_file_content",
+    if state in ("admin_awaiting_capital_content", "adm_awaiting_trial_file_content",
                   "adm_awaiting_paid_file_content", "adm_awaiting_new_file_content", "adm_awaiting_edit_file_content",
-                  "admin_chat_active", "user_chat_active"):  # ← حذف ماژول ربات مدیریت سرمایه/پیام به ادمین/چت لایسنس/کتابخانه = پاک کن این خط
+                  "admin_chat_active", "user_chat_active",
+                  "admin_msg_chat_active", "user_msg_chat_active"):  # ← حذف ماژول ربات مدیریت سرمایه/پیام به ادمین/چت لایسنس/کتابخانه = پاک کن این خط
         handled = await handle_admin_generic_content(update, context)
         if handled:
             return
@@ -8554,6 +8920,7 @@ async def post_init(app):
     asyncio.create_task(alarm_loop(app))
     asyncio.create_task(reminder_loop(app))  # ← حذف ماژول یادآور = پاک کن این خط
     asyncio.create_task(license_escalation_loop(app))  # ← حذف انتقال خودکار چت لایسنس = پاک کن این خط
+    asyncio.create_task(msg_chat_escalation_loop(app))  # ← حذف انتقال خودکار پیام به ادمین = پاک کن این خط
     print("⏰ سیستم آلارم فعال شد")
 
 async def license_escalation_loop(app):
@@ -8585,16 +8952,61 @@ async def license_escalation_loop(app):
                     )
                 except Exception as e:
                     print(f"خطای اطلاع‌رسانی واگذاری خودکار به ادمین {next_admin_id}: {e}")
-                try:
-                    await app.bot.send_message(
-                        ADMIN_ID,
-                        f"ℹ️ درخواست لایسنس کاربر {target_user_id} بعد از ۱۵ دقیقه بی‌پاسخی، "
-                        f"خودکار به ادمین {next_admin_id} واگذار شد."
-                    )
-                except Exception as e:
-                    print(f"خطای اطلاع کوتاه واگذاری خودکار به مالک اصلی: {e}")
+                for primary_id in PRIMARY_ADMIN_IDS:
+                    try:
+                        await app.bot.send_message(
+                            primary_id,
+                            f"ℹ️ درخواست لایسنس کاربر {target_user_id} بعد از ۱۵ دقیقه بی‌پاسخی، "
+                            f"خودکار به ادمین {next_admin_id} واگذار شد."
+                        )
+                    except Exception as e:
+                        print(f"خطای اطلاع کوتاه واگذاری خودکار به مالک اصلی {primary_id}: {e}")
         except Exception as e:
             print(f"خطای license_escalation_loop: {e}")
+        await asyncio.sleep(60)
+
+async def msg_chat_escalation_loop(app):
+    """
+    مشابه license_escalation_loop ولی برای گفتگوهای «📩 پیام به ادمین» --
+    هر ۶۰ ثانیه چک می‌کند و پیام‌های بیش‌از-۱۵-دقیقه‌ی بی‌پاسخ را به‌صورت
+    round-robin مستقل (صف جدا از چت لایسنس) واگذار می‌کند. همچنین در هر
+    دور، لاگ گفتگوهای قدیمی‌تر از ۱۰ روز را هم پاک می‌کند.
+    """
+    while True:
+        try:
+            purge_old_msg_chat_logs(days=10)
+            overdue = get_overdue_pending_msg_chats(minutes=15)
+            for chat_id, target_user_id in overdue:
+                next_admin_id = get_next_round_robin_admin(setting_key="msg_round_robin_index")
+                if next_admin_id is None:
+                    continue
+                assign_msg_chat_admin(chat_id, next_admin_id)
+                original_text = get_msg_chat_original_text(chat_id)
+                try:
+                    requester_target = await app.bot.get_chat(target_user_id)
+                    req_name, req_username = requester_target.first_name or "کاربر", requester_target.username
+                except Exception:
+                    req_name, req_username = "کاربر", None
+                try:
+                    await app.bot.send_message(
+                        next_admin_id,
+                        f"⏰ این پیام بیش از ۱۵ دقیقه بی‌پاسخ مانده و خودکار به شما واگذار شد:\n\n"
+                        + msg_request_text(req_name, req_username, target_user_id, original_text),
+                        reply_markup=msg_request_assigned_menu(chat_id)
+                    )
+                except Exception as e:
+                    print(f"خطای اطلاع‌رسانی واگذاری خودکار پیام به ادمین {next_admin_id}: {e}")
+                for primary_id in PRIMARY_ADMIN_IDS:
+                    try:
+                        await app.bot.send_message(
+                            primary_id,
+                            f"ℹ️ پیام کاربر {target_user_id} بعد از ۱۵ دقیقه بی‌پاسخی، "
+                            f"خودکار به ادمین {next_admin_id} واگذار شد."
+                        )
+                    except Exception as e:
+                        print(f"خطای اطلاع کوتاه واگذاری خودکار پیام به مالک اصلی {primary_id}: {e}")
+        except Exception as e:
+            print(f"خطای msg_chat_escalation_loop: {e}")
         await asyncio.sleep(60)
 
 # ─── Web server ساده برای Railway (بدون این Railway بات رو خاموش می‌کنه) ───
@@ -8683,45 +9095,74 @@ async def handle_admin_capital_content(update, context):
     )
     return True
 
-async def handle_admin_reply_content(update, context):
-    """
-    دریافت پاسخ ادمین (متن، عکس، فایل، صدا، یا ویدیو) به پیامی که یک
-    کاربر از طریق «📩 پیام به ادمین» فرستاده بود، و ارسال خودکار همان
-    پاسخ برای همان کاربر. برخلاف ربات مدیریت سرمایه، این فیچر تک‌پیامی
-    است (نیازی به دکمه‌ی پایان ندارد چون معمولاً یک پاسخ کافی است).
-    خروجی: True اگر پردازش شد، False اگر این ماژول منتظر پاسخ نبود.
-    """
-    admin_user_id = update.effective_user.id
-    if not is_admin(admin_user_id):
-        return False
-    state, data = get_state(admin_user_id)
-    if state != "admin_awaiting_reply_content":
-        return False
+def summarize_message_for_log(msg):
+    """خلاصه‌ی کوتاه یک پیام تلگرام برای ثبت در لاگ گفتگو (برای اکسل بعدی) -- برای متن خود متن، برای رسانه فقط نوعش"""
+    if msg.text:
+        return msg.text[:500]
+    if msg.document:
+        base = f"[فایل: {msg.document.file_name or 'بدون‌نام'}]"
+        return f"{base} -- {msg.caption}" if msg.caption else base
+    if msg.photo:
+        return f"[عکس] -- {msg.caption}" if msg.caption else "[عکس]"
+    if msg.audio:
+        return f"[فایل صوتی] -- {msg.caption}" if msg.caption else "[فایل صوتی]"
+    if msg.video:
+        return f"[ویدیو] -- {msg.caption}" if msg.caption else "[ویدیو]"
+    if msg.voice:
+        return "[پیام صوتی]"
+    return "[نوع پیام ناشناخته]"
 
-    try:
-        message_id_str, target_user_id_str = data.split(":")
-        message_id = int(message_id_str)
-        target_user_id = int(target_user_id_str)
-    except Exception:
-        await update.message.reply_text("❌ خطای داخلی؛ لطفاً دوباره از پیام کاربر شروع کنید.")
-        clear_state(admin_user_id)
-        return True
-
+async def handle_msg_chat_content(update, context):
+    """
+    رله‌ی دوطرفه‌ی محتوا (متن/عکس/فایل/صدا/ویدیو) بین ادمین و کاربری که
+    از طریق «📩 پیام به ادمین» گفتگو باز کرده -- دقیقاً مثل چت لایسنس،
+    با این تفاوت که هر پیام (هر دو جهت) در msg_chat_logs هم ثبت می‌شود
+    (برای گزارش اکسل ۱۰-روزه‌ی ادمین). خروجی: True اگر پردازش شد،
+    False اگر این ماژول منتظر محتوا نبود.
+    """
+    sender_id = update.effective_user.id
+    state, data = get_state(sender_id)
     msg = update.message
-    default_caption = "📩 پاسخ ادمین به پیام شما:"
-    prefix = f"{default_caption}\n\n"
 
-    sent = await relay_free_message(msg, context, target_user_id, prefix=prefix)
-    if not sent:
-        await update.message.reply_text(
-            "❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید."
-        )
+    if state == "admin_msg_chat_active" and is_admin(sender_id):
+        try:
+            chat_id_str, target_user_id_str = data.split(":")
+            chat_id = int(chat_id_str)
+            target_user_id = int(target_user_id_str)
+        except Exception:
+            await update.message.reply_text("❌ خطای داخلی؛ لطفاً دوباره از پیام کاربر شروع کنید.")
+            clear_state(sender_id)
+            return True
+
+        action_menu = msg_chat_action_menu(chat_id)
+        sent = await relay_free_message(msg, context, target_user_id)
+        if sent:
+            log_msg_chat_message(chat_id, target_user_id, sender_id, "admin_to_user", summarize_message_for_log(msg))
+            await update.message.reply_text("✅ برای کاربر ارسال شد.", reply_markup=action_menu)
+        else:
+            await update.message.reply_text(
+                "❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.",
+                reply_markup=action_menu
+            )
         return True
 
-    mark_user_admin_message_replied(message_id)
-    await update.message.reply_text("✅ پاسخ برای کاربر ارسال شد.")
-    clear_state(admin_user_id)
-    return True
+    if state == "user_msg_chat_active":
+        try:
+            chat_id_str, owning_admin_id_str = data.split(":")
+            chat_id = int(chat_id_str)
+            owning_admin_id = int(owning_admin_id_str)
+        except Exception:
+            await update.message.reply_text("❌ خطای داخلی؛ لطفاً دوباره از ⚙️ تنظیمات → 📩 پیام به ادمین شروع کنید.")
+            clear_state(sender_id)
+            return True
+        sent = await relay_free_message(msg, context, owning_admin_id, prefix=f"💬 پیام از کاربر (آیدی {sender_id}):\n")
+        if sent:
+            log_msg_chat_message(chat_id, sender_id, owning_admin_id, "user_to_admin", summarize_message_for_log(msg))
+        else:
+            await update.message.reply_text("❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.")
+        return True
+
+    return False
 
 async def handle_admin_keyed_file_upload(update, context):
     """
@@ -8736,7 +9177,7 @@ async def handle_admin_keyed_file_upload(update, context):
         return False
     state, _ = get_state(admin_user_id)
     state_map = {
-        "adm_awaiting_trial_file_content": ("trial_file", "نسخه‌ی تست", admin_panel_menu()),
+        "adm_awaiting_trial_file_content": ("trial_file", "نسخه‌ی تست", admin_panel_menu(admin_user_id)),
         "adm_awaiting_paid_file_content": ("paid_file", "نسخه‌ی پولی", admin_library_menu()),
     }
     if state not in state_map:
@@ -8852,7 +9293,7 @@ async def handle_admin_broadcast_content_media(update, context):
 
     target_ids = parse_broadcast_target_ids(target_data)
     if not target_ids:
-        await update.message.reply_text("❌ هیچ مقصدی برای ارسال پیدا نشد.", reply_markup=admin_panel_menu())
+        await update.message.reply_text("❌ هیچ مقصدی برای ارسال پیدا نشد.", reply_markup=admin_panel_menu(admin_user_id))
         clear_state(admin_user_id)
         return True
 
@@ -8929,7 +9370,7 @@ async def handle_admin_generic_content(update, context):
     """
     if await handle_admin_capital_content(update, context):
         return True
-    if await handle_admin_reply_content(update, context):
+    if await handle_msg_chat_content(update, context):
         return True
     if await handle_admin_keyed_file_upload(update, context):
         return True
