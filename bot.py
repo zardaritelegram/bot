@@ -90,9 +90,9 @@ def init_db():
         label TEXT, content TEXT, created_at TEXT)''')  # ← حذف کتابخانه متن ادمین = پاک کن این خط
     c.execute('''CREATE TABLE IF NOT EXISTS admins (
         user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT)''')  # ← حذف چندادمینی = پاک کن این خط
-    c.execute('''CREATE TABLE IF NOT EXISTS social_links (
+    c.execute('''CREATE TABLE IF NOT EXISTS promo_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        label TEXT, url TEXT, created_at TEXT)''')  # ← حذف لینک‌های تبلیغاتی = پاک کن این خط
+        label TEXT, file_type TEXT, file_id TEXT, caption TEXT, link_url TEXT, created_at TEXT)''')  # ← حذف محتوای تبلیغاتی = پاک کن این خط
     for col_def in [
         "ALTER TABLE users ADD COLUMN daily_msg INTEGER DEFAULT 1",
         "ALTER TABLE users ADD COLUMN referral_code TEXT",
@@ -166,31 +166,93 @@ def get_all_extra_admins():
     conn.close()
     return rows
 
-# ─── لینک‌های تبلیغاتی/شبکه‌های اجتماعی (فقط مالکین اصلی مدیریت می‌کنند) ──
-def add_social_link(label, url):
+# ─── محتوای تبلیغاتی (فقط مالکین اصلی مدیریت می‌کنند) -- هر آیتم ────
+# ─── می‌تواند هر ترکیبی از عکس/ویدیو/فایل/صدا + متن + لینک باشد ────
+def add_promo_item(label, file_type, file_id, caption, link_url):
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("INSERT INTO social_links (label, url, created_at) VALUES (?, ?, ?)",
-              (label, url, get_iran_now().strftime("%Y-%m-%d %H:%M")))
-    link_id = c.lastrowid
+    c.execute('''INSERT INTO promo_items (label, file_type, file_id, caption, link_url, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (label, file_type, file_id, caption, link_url, get_iran_now().strftime("%Y-%m-%d %H:%M")))
+    item_id = c.lastrowid
     conn.commit()
     conn.close()
-    return link_id
+    return item_id
 
-def get_social_links():
+def get_promo_items():
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("SELECT id, label, url FROM social_links ORDER BY id")
+    c.execute("SELECT id, label, file_type, file_id, caption, link_url FROM promo_items ORDER BY id")
     rows = c.fetchall()
     conn.close()
     return rows
 
-def delete_social_link(link_id):
+def get_promo_item(item_id):
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
-    c.execute("DELETE FROM social_links WHERE id=?", (link_id,))
+    c.execute("SELECT label, file_type, file_id, caption, link_url FROM promo_items WHERE id=?", (item_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def update_promo_item(item_id, label, file_type, file_id, caption, link_url):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute('''UPDATE promo_items SET label=?, file_type=?, file_id=?, caption=?, link_url=? WHERE id=?''',
+              (label, file_type, file_id, caption, link_url, item_id))
     conn.commit()
     conn.close()
+
+def delete_promo_item(item_id):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM promo_items WHERE id=?", (item_id,))
+    conn.commit()
+    conn.close()
+
+def save_promo_item_from_wizard(info):
+    """
+    ذخیره یا به‌روزرسانی یک آیتم تبلیغاتی از دیکشنری جمع‌شده‌ی ویزارد
+    (label/file_type/file_id/caption/link_url). اگر info شامل "edit_id"
+    باشد، همان ردیف به‌روزرسانی می‌شود؛ وگرنه یک ردیف جدید اضافه می‌شود.
+    خروجی: (item_id, label)
+    """
+    label = info.get("label") or "بدون‌نام"
+    file_type = info.get("file_type")
+    file_id = info.get("file_id")
+    caption = info.get("caption")
+    link_url = info.get("link_url")
+    if info.get("edit_id"):
+        item_id = info["edit_id"]
+        update_promo_item(item_id, label, file_type, file_id, caption, link_url)
+    else:
+        item_id = add_promo_item(label, file_type, file_id, caption, link_url)
+    return item_id, label
+
+async def send_promo_items_to_user(context, chat_id):
+    """ارسال پشت‌سرهم همه‌ی آیتم‌های تبلیغاتی برای یک کاربر (هر آیتم با هر ترکیبی از فایل/متن/لینک که دارد)"""
+    items = get_promo_items()
+    for item_id, label, file_type, file_id, caption, link_url in items:
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 مشاهده لینک", url=link_url)]]) if link_url else None
+        text_to_send = caption or (label if not file_id else None)
+        try:
+            if file_type == "photo":
+                await context.bot.send_photo(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif file_type == "video":
+                await context.bot.send_video(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif file_type == "audio":
+                await context.bot.send_audio(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif file_type == "document":
+                await context.bot.send_document(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif file_type == "voice":
+                await context.bot.send_voice(chat_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif text_to_send:
+                await context.bot.send_message(chat_id, text_to_send, reply_markup=reply_markup)
+            elif reply_markup:
+                await context.bot.send_message(chat_id, label, reply_markup=reply_markup)
+        except Exception as e:
+            print(f"خطای ارسال آیتم تبلیغاتی {item_id}: {e}")
+    return len(items) > 0
 
 def get_all_admin_ids():
     """لیست همه‌ی آیدی‌های ادمین (همه‌ی مالکین اصلی + همه‌ی ادمین‌های اضافه) -- برای اطلاع‌رسانی به همه"""
@@ -3335,17 +3397,16 @@ async def handle_settings(query, user_id, context):
     if data == "menu_settings":
         await query.edit_message_text("⚙️ تنظیمات:", reply_markup=settings_menu())
 
-    elif data == "menu_social_links":  # ← حذف لینک‌های تبلیغاتی = پاک کن این بلوک
-        links = get_social_links()
-        if not links:
+    elif data == "menu_social_links":  # ← حذف محتوای تبلیغاتی = پاک کن این بلوک
+        await query.answer("⏳ در حال ارسال...")
+        sent_any = await send_promo_items_to_user(context, user_id)
+        if not sent_any:
             await query.edit_message_text(
-                "📢 هنوز لینکی ثبت نشده.",
+                "📢 هنوز محتوایی ثبت نشده.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="menu_settings")]])
             )
             return
-        rows = [[InlineKeyboardButton(label, url=url)] for _id, label, url in links]
-        rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="menu_settings")])
-        await query.edit_message_text("📢 صفحات و شبکه‌های ما:", reply_markup=InlineKeyboardMarkup(rows))
+        await query.message.reply_text("👆 صفحات و شبکه‌های ما", reply_markup=settings_menu())
 
     elif data == "set_profile":
         db_user = get_user(user_id)
@@ -3876,7 +3937,7 @@ def admin_panel_menu(user_id):
     if is_primary_admin(user_id):
         rows.append([InlineKeyboardButton("🔎 مدیریت سریع یک کاربر (با آیدی)", callback_data="adm_manage_user")])
         rows.append([InlineKeyboardButton("👥 مدیریت ادمین‌ها", callback_data="adm_manage_admins")])  # ← حذف چندادمینی = پاک کن این خط
-        rows.append([InlineKeyboardButton("🔗 لینک‌های تبلیغاتی", callback_data="adm_social_links")])  # ← حذف لینک‌های تبلیغاتی = پاک کن این خط
+        rows.append([InlineKeyboardButton("📢 محتوای تبلیغاتی", callback_data="adm_promo_items")])  # ← حذف محتوای تبلیغاتی = پاک کن این خط
         rows.append([InlineKeyboardButton("📥 اکسل گفتگوهای پشتیبانی (۱۰ روز)", callback_data="adm_export_msg_logs")])  # ← حذف فیچر پیام به ادمین = پاک کن این خط
     rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
@@ -3989,7 +4050,7 @@ async def handle_admin_panel(query, user_id, context):
     # ─── دفاع در عمق: علاوه بر مخفی بودن این دکمه‌ها در منو برای ادمین‌های
     # اضافه، اگر کسی مستقیم callback_data را بزند هم همینجا رد می‌شود ───
     _primary_only_prefixes = ("adm_users", "adm_export_users", "adm_manage_user", "adm_block_",
-                               "adm_activate_", "adm_broadcast_", "adm_social_link", "adm_export_msg_logs")
+                               "adm_activate_", "adm_broadcast_", "adm_promo", "adm_export_msg_logs")
     if data.startswith(_primary_only_prefixes) and not is_primary_admin(user_id):
         await query.answer("⛔ این بخش فقط برای مالک اصلی ربات است.", show_alert=True)
         return
@@ -4461,34 +4522,127 @@ async def handle_admin_panel(query, user_id, context):
             print(f"خطای اطلاع‌رسانی لغو دسترسی ادمین: {e}")
         await query.edit_message_text("✅ حذف شد.", reply_markup=admin_manage_admins_menu())
 
-    elif data == "adm_social_links":  # ← حذف لینک‌های تبلیغاتی = پاک کن این ۳ بلوک elif
-        links = get_social_links()
-        rows = [[InlineKeyboardButton(f"🗑 {label}", callback_data=f"adm_social_link_del_{lid}")]
-                for lid, label, url in links]
-        rows.append([InlineKeyboardButton("➕ افزودن لینک جدید", callback_data="adm_social_link_add")])
+    elif data == "adm_promo_items":  # ← حذف محتوای تبلیغاتی = پاک کن این ۸ بلوک elif
+        items = get_promo_items()
+        rows = [[InlineKeyboardButton(f"📄 {label}", callback_data=f"adm_promo_view_{iid}")]
+                for iid, label, *_rest in items]
+        rows.append([InlineKeyboardButton("➕ افزودن آیتم جدید", callback_data="adm_promo_add")])
         rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")])
         await query.edit_message_text(
-            f"🔗 لینک‌های تبلیغاتی (تعداد: {len(links)})\n\n"
-            f"این لینک‌ها زیر ⚙️ تنظیمات → 📢 صفحات و شبکه‌های ما به همه‌ی کاربران نشان داده می‌شود.",
+            f"📢 محتوای تبلیغاتی (تعداد: {len(items)})\n\n"
+            f"هر آیتم می‌تواند شامل هر ترکیبی از عکس/ویدیو/فایل/صدا + متن + لینک باشد. "
+            f"همه‌ی آیتم‌ها زیر ⚙️ تنظیمات → 📢 صفحات و شبکه‌های ما پشت‌سرهم به کاربر نشان داده می‌شود.",
             reply_markup=InlineKeyboardMarkup(rows)
         )
 
-    elif data == "adm_social_link_add":
-        set_state(user_id, "adm_awaiting_social_link_label")
+    elif data == "adm_promo_add":
+        import json
+        set_state(user_id, "adm_awaiting_promo_label", json.dumps({}))
         await query.edit_message_text(
-            "اسمی که کاربر می‌بیند را بنویسید (مثلاً «📸 اینستاگرام» یا «📢 کانال تلگرام»):",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="adm_social_links")]])
+            "یک اسم کوتاه برای شناسایی این آیتم بنویسید (فقط برای خودتان تو لیست، کاربر آن را نمی‌بیند):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data="adm_promo_items")]])
         )
 
-    elif data.startswith("adm_social_link_del_"):
-        link_id = int(data.replace("adm_social_link_del_", ""))
-        delete_social_link(link_id)
-        links = get_social_links()
-        rows = [[InlineKeyboardButton(f"🗑 {label}", callback_data=f"adm_social_link_del_{lid}")]
-                for lid, label, url in links]
-        rows.append([InlineKeyboardButton("➕ افزودن لینک جدید", callback_data="adm_social_link_add")])
+    elif data.startswith("adm_promo_view_"):
+        item_id = int(data.replace("adm_promo_view_", ""))
+        row = get_promo_item(item_id)
+        if not row:
+            await query.answer("این آیتم پیدا نشد.", show_alert=True)
+            return
+        label, file_type, file_id, caption, link_url = row
+        details = (f"📄 {label}\n\nنوع فایل: {file_type or 'ندارد'}\n"
+                   f"متن: {caption or 'ندارد'}\nلینک: {link_url or 'ندارد'}")
+        await query.edit_message_text(
+            details,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👁 پیش‌نمایش (ارسال برای خودم)", callback_data=f"adm_promo_preview_{item_id}")],
+                [InlineKeyboardButton("✏️ ویرایش", callback_data=f"adm_promo_edit_{item_id}"),
+                 InlineKeyboardButton("🗑 حذف", callback_data=f"adm_promo_del_{item_id}")],
+                [InlineKeyboardButton("🔙 برگشت", callback_data="adm_promo_items")],
+            ])
+        )
+
+    elif data.startswith("adm_promo_preview_"):
+        item_id = int(data.replace("adm_promo_preview_", ""))
+        row = get_promo_item(item_id)
+        if not row:
+            await query.answer("این آیتم پیدا نشد.", show_alert=True)
+            return
+        label, file_type, file_id, caption, link_url = row
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 مشاهده لینک", url=link_url)]]) if link_url else None
+        try:
+            if file_type == "photo":
+                await context.bot.send_photo(user_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif file_type == "video":
+                await context.bot.send_video(user_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif file_type == "audio":
+                await context.bot.send_audio(user_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif file_type == "document":
+                await context.bot.send_document(user_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif file_type == "voice":
+                await context.bot.send_voice(user_id, file_id, caption=caption or None, reply_markup=reply_markup)
+            elif caption:
+                await context.bot.send_message(user_id, caption, reply_markup=reply_markup)
+            elif reply_markup:
+                await context.bot.send_message(user_id, label, reply_markup=reply_markup)
+            await query.answer("✅ پیش‌نمایش ارسال شد.")
+        except Exception as e:
+            await query.answer(f"❌ خطا: {e}", show_alert=True)
+
+    elif data.startswith("adm_promo_edit_"):
+        import json
+        item_id = int(data.replace("adm_promo_edit_", ""))
+        row = get_promo_item(item_id)
+        if not row:
+            await query.answer("این آیتم پیدا نشد.", show_alert=True)
+            return
+        label = row[0]
+        set_state(user_id, "adm_awaiting_promo_label", json.dumps({"edit_id": item_id}))
+        await query.edit_message_text(
+            f"✏️ ویرایش «{label}»\n\nاسم جدید را بنویسید (یا همین اسم قبلی را دوباره بفرستید):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data=f"adm_promo_view_{item_id}")]])
+        )
+
+    elif data.startswith("adm_promo_del_"):
+        item_id = int(data.replace("adm_promo_del_", ""))
+        delete_promo_item(item_id)
+        items = get_promo_items()
+        rows = [[InlineKeyboardButton(f"📄 {label}", callback_data=f"adm_promo_view_{iid}")]
+                for iid, label, *_rest in items]
+        rows.append([InlineKeyboardButton("➕ افزودن آیتم جدید", callback_data="adm_promo_add")])
         rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="admin_panel")])
-        await query.edit_message_text(f"✅ حذف شد.\n\n🔗 لینک‌های تبلیغاتی (تعداد: {len(links)})", reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text(f"✅ حذف شد.\n\n📢 محتوای تبلیغاتی (تعداد: {len(items)})", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data == "adm_promo_skip_content":
+        import json
+        state, data_str = get_state(user_id)
+        if state != "adm_awaiting_promo_content":
+            await query.answer("این عملیات دیگر معتبر نیست.", show_alert=True)
+            return
+        info = json.loads(data_str)
+        info["file_type"] = None
+        info["file_id"] = None
+        info["caption"] = None
+        set_state(user_id, "adm_awaiting_promo_link", json.dumps(info))
+        await query.edit_message_text(
+            "حالا لینک را بفرستید (باید با http:// یا https:// شروع شود)؛ اگه لینک نمی‌خواهید، رد کن را بزنید.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ رد کن (بدون لینک)", callback_data="adm_promo_skip_link")]])
+        )
+
+    elif data == "adm_promo_skip_link":
+        import json
+        state, data_str = get_state(user_id)
+        if state != "adm_awaiting_promo_link":
+            await query.answer("این عملیات دیگر معتبر نیست.", show_alert=True)
+            return
+        info = json.loads(data_str)
+        info["link_url"] = None
+        clear_state(user_id)
+        item_id, label = save_promo_item_from_wizard(info)
+        await query.edit_message_text(
+            f"✅ آیتم «{label}» ذخیره شد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت به لیست", callback_data="adm_promo_items")]])
+        )
 
     elif data.startswith("adm_block_") or data.startswith("adm_activate_"):
         target_uid = int(data.split("_")[-1])
@@ -4616,27 +4770,35 @@ async def handle_admin_panel_message(user_id, text, update):
         )
         return True
 
-    elif state == "adm_awaiting_social_link_label":  # ← حذف لینک‌های تبلیغاتی = پاک کن این ۲ بلوک elif
+    elif state == "adm_awaiting_promo_label":  # ← حذف محتوای تبلیغاتی = پاک کن این ۲ بلوک elif
         if not is_primary_admin(user_id):
             clear_state(user_id)
             return True
-        label = text.strip()[:60]
-        set_state(user_id, "adm_awaiting_social_link_url", label)
-        await update.message.reply_text(f"حالا آدرس (لینک) «{label}» را بفرستید (باید با http:// یا https:// شروع شود):")
+        import json
+        info = json.loads(data) if data else {}
+        info["label"] = text.strip()[:60]
+        set_state(user_id, "adm_awaiting_promo_content", json.dumps(info))
+        await update.message.reply_text(
+            "حالا محتوا را بفرستید: هر ترکیبی از عکس/ویدیو/فایل/صدا + متن (کپشن)، یا فقط متن. "
+            "اگه محتوا نمی‌خواهید (فقط لینک کافیه)، رد کن را بزنید.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ رد کن (بدون فایل/متن)", callback_data="adm_promo_skip_content")]])
+        )
         return True
 
-    elif state == "adm_awaiting_social_link_url":
+    elif state == "adm_awaiting_promo_link":
         if not is_primary_admin(user_id):
             clear_state(user_id)
             return True
+        import json
         url = text.strip()
         if not (url.startswith("http://") or url.startswith("https://")):
-            await update.message.reply_text("❌ لینک باید با http:// یا https:// شروع شود. دوباره بفرستید:")
+            await update.message.reply_text("❌ لینک باید با http:// یا https:// شروع شود. دوباره بفرستید، یا رد کن را بزنید.")
             return True
-        label = data
-        add_social_link(label, url)
+        info = json.loads(data) if data else {}
+        info["link_url"] = url
         clear_state(user_id)
-        await update.message.reply_text(f"✅ لینک «{label}» اضافه شد.", reply_markup=admin_panel_menu(user_id))
+        item_id, label = save_promo_item_from_wizard(info)
+        await update.message.reply_text(f"✅ آیتم «{label}» ذخیره شد.", reply_markup=admin_panel_menu(user_id))
         return True
 
     elif state == "adm_awaiting_new_file_label":  # ← حذف کتابخانه = پاک کن این ۴ بلوک elif
@@ -8856,7 +9018,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state in ("admin_awaiting_capital_content", "adm_awaiting_trial_file_content",
                   "adm_awaiting_paid_file_content", "adm_awaiting_new_file_content", "adm_awaiting_edit_file_content",
                   "admin_chat_active", "user_chat_active",
-                  "admin_msg_chat_active", "user_msg_chat_active"):  # ← حذف ماژول ربات مدیریت سرمایه/پیام به ادمین/چت لایسنس/کتابخانه = پاک کن این خط
+                  "admin_msg_chat_active", "user_msg_chat_active",
+                  "adm_awaiting_promo_content"):  # ← حذف ماژول ربات مدیریت سرمایه/پیام به ادمین/چت لایسنس/کتابخانه/محتوای تبلیغاتی = پاک کن این خط
         handled = await handle_admin_generic_content(update, context)
         if handled:
             return
@@ -9265,6 +9428,45 @@ async def handle_admin_library_file_edit(update, context):
     await update.message.reply_text(f"✅ فایل «{new_label}» به‌روزرسانی شد.", reply_markup=admin_library_menu())
     return True
 
+async def handle_admin_promo_content_input(update, context):
+    """
+    مرحله‌ی دوم ویزارد افزودن/ویرایش آیتم تبلیغاتی -- گرفتن محتوا (هر
+    ترکیبی از عکس/ویدیو/فایل/صدا + متن، یا فقط متن). مرحله‌ی اول (اسم)
+    در handle_admin_panel_message است؛ رد کردن این مرحله هم با دکمه
+    (adm_promo_skip_content) در ROUTER اصلی مدیریت می‌شود، نه اینجا.
+    خروجی: True اگر پردازش شد، False اگر این ماژول منتظر محتوا نبود.
+    """
+    admin_user_id = update.effective_user.id
+    if not is_primary_admin(admin_user_id):
+        return False
+    state, data = get_state(admin_user_id)
+    if state != "adm_awaiting_promo_content":
+        return False
+
+    import json
+    info = json.loads(data) if data else {}
+    msg = update.message
+    file_type, file_id = detect_message_content(msg)
+    if file_type is None:
+        await update.message.reply_text("❌ نوع پیام پشتیبانی نمی‌شود؛ لطفاً متن، عکس، فایل، صدا یا ویدیو بفرستید.")
+        return True
+
+    if file_type == "text":
+        info["file_type"] = None
+        info["file_id"] = None
+        info["caption"] = msg.text
+    else:
+        info["file_type"] = file_type
+        info["file_id"] = file_id
+        info["caption"] = msg.caption
+
+    set_state(admin_user_id, "adm_awaiting_promo_link", json.dumps(info))
+    await update.message.reply_text(
+        "حالا لینک را بفرستید (باید با http:// یا https:// شروع شود)؛ اگه لینک نمی‌خواهید، رد کن را بزنید.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ رد کن (بدون لینک)", callback_data="adm_promo_skip_link")]])
+    )
+    return True
+
 async def handle_admin_broadcast_content_media(update, context):
     """
     دریافت محتوای غیرمتنی (عکس/فایل/صدا/ویدیو -- حتی فوروارد از یک
@@ -9377,6 +9579,8 @@ async def handle_admin_generic_content(update, context):
     if await handle_admin_library_file_upload(update, context):
         return True
     if await handle_admin_library_file_edit(update, context):
+        return True
+    if await handle_admin_promo_content_input(update, context):
         return True
     if await handle_admin_broadcast_content_media(update, context):
         return True
